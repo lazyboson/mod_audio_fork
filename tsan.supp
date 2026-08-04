@@ -10,3 +10,8 @@ race:lws_cancel_service
 # a log line — never protocol or connection state.
 race:__lws_lc_tag
 race:__lws_lc_untag
+
+# lws's _realloc (lib/core/alloc.c) bumps a global allocation-stats counter
+# without atomics; independent contexts on their own threads race on it. The
+# returned pointers themselves are thread-local — this is pure accounting.
+race:_realloc
