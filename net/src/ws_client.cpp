@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <utility>
 
 namespace audiofork::net {
@@ -27,6 +28,44 @@ constexpr std::array<lws_protocols, 2> kProtocols{{
 
 }  // namespace
 
+// lws_sul entries are intrusive: the callback recovers the owning handle with
+// lws_container_of, so the sul must be the first member and the handle must
+// outlive every scheduled firing.
+struct TickHandle {
+  lws_sorted_usec_list_t sul{};
+  WsEventLoop* loop = nullptr;
+  lws_context* context = nullptr;
+  lws_usec_t interval_us = 0;
+};
+
+namespace {
+
+void OnSulTick(lws_sorted_usec_list_t* sul) {
+  auto* handle = lws_container_of(sul, TickHandle, sul);
+  lws_sul_schedule(handle->context, 0, &handle->sul, OnSulTick, handle->interval_us);
+  handle->loop->OnTick();
+}
+
+}  // namespace
+
+TickHandle* CreateTickHandle(WsEventLoop& loop, lws_context* context,
+                             std::chrono::milliseconds interval) {
+  auto handle = std::make_unique<TickHandle>();
+  handle->loop = &loop;
+  handle->context = context;
+  handle->interval_us = static_cast<lws_usec_t>(interval.count()) * LWS_US_PER_MS;
+  lws_sul_schedule(context, 0, &handle->sul, OnSulTick, handle->interval_us);
+  return handle.release();
+}
+
+void DestroyTickHandle(TickHandle* handle) {
+  if (handle == nullptr) {
+    return;
+  }
+  lws_sul_cancel(&handle->sul);
+  delete handle;
+}
+
 void EnsureLwsLogPolicy() {
   // lws_set_log_level writes lws globals; a magic static makes the write happen
   // exactly once, before any lws service thread this process spawns can read them
@@ -35,6 +74,11 @@ void EnsureLwsLogPolicy() {
     return true;
   }();
   (void)configured;
+}
+
+std::mutex& LwsLifecycleMutex() {
+  static std::mutex mutex;
+  return mutex;
 }
 
 WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes)
@@ -84,6 +128,7 @@ std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
   info.port = CONTEXT_PORT_NO_LISTEN;
   info.protocols = kProtocols.data();
   info.user = loop.get();
+  const std::scoped_lock lifecycle(LwsLifecycleMutex());
   loop->context_ = lws_create_context(&info);
   if (loop->context_ == nullptr) {
     return nullptr;
@@ -94,9 +139,13 @@ std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
 WsEventLoop::WsEventLoop(PrivateTag) {}
 
 WsEventLoop::~WsEventLoop() {
+  // the tick's sul lives on a list owned by the context, so it must be
+  // cancelled BEFORE the context is destroyed
+  tick_.reset();
   if (context_ != nullptr) {
     // fires LWS_CALLBACK_CLIENT_CLOSED for every live wsi, so handlers still
     // receive OnClosed during destruction
+    const std::scoped_lock lifecycle(LwsLifecycleMutex());
     lws_context_destroy(context_);
   }
   connections_.clear();
@@ -106,6 +155,43 @@ void WsEventLoop::Run() {
   while (!stop_.load(std::memory_order_acquire)) {
     lws_service(context_, 0);
     DrainPosted();
+    DrainDueTimers();
+  }
+}
+
+void WsEventLoop::SetTick(std::chrono::milliseconds interval, std::function<void()> on_tick) {
+  tick_interval_ = std::max(interval, std::chrono::milliseconds{1});
+  on_tick_ = std::move(on_tick);
+  tick_.reset(CreateTickHandle(*this, context_, tick_interval_));
+}
+
+void WsEventLoop::ScheduleTimer(std::chrono::milliseconds delay, std::function<void()> task) {
+  timers_.push_back(PendingTimer{std::chrono::steady_clock::now() + delay, std::move(task)});
+}
+
+void WsEventLoop::OnTick() {
+  DrainDueTimers();
+  if (on_tick_) {
+    on_tick_();
+  }
+}
+
+void WsEventLoop::DrainDueTimers() {
+  if (timers_.empty()) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<std::function<void()>> due;
+  auto partition =
+      std::stable_partition(timers_.begin(), timers_.end(),
+                            [now](const PendingTimer& timer) { return timer.deadline > now; });
+  for (auto it = partition; it != timers_.end(); ++it) {
+    due.push_back(std::move(it->task));
+  }
+  timers_.erase(partition, timers_.end());
+  // run outside the container: a task may schedule another timer
+  for (auto& task : due) {
+    task();
   }
 }
 

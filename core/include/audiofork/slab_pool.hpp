@@ -37,6 +37,7 @@ class SlabLease {
   ~SlabLease();
 
   [[nodiscard]] MutableByteSpan bytes() noexcept;
+  [[nodiscard]] ConstByteSpan bytes() const noexcept;
 
  private:
   friend class SlabPool;

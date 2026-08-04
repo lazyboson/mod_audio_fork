@@ -1,0 +1,24 @@
+<!-- Install as conf/autoload_configs/audio_fork.conf.xml: switch_xml_open_cfg
+     only finds it there, and a file left at the conf root is silently ignored
+     (the module then runs on defaults). -->
+<configuration name="audio_fork.conf" description="mod_audio_fork">
+  <settings>
+    <!-- 0 = one shard per CPU core, capped at 16 -->
+    <param name="shard-count" value="0"/>
+
+    <!-- outbound audio held per fork before the oldest is dropped -->
+    <param name="send-buffer-seconds" value="10"/>
+
+    <!-- audio per websocket message; larger means fewer syscalls, more latency -->
+    <param name="coalesce-max-ms" value="100"/>
+
+    <!-- ceiling for all fork buffers together; new forks are refused and
+         stalled forks degrade rather than letting FreeSWITCH be OOM-killed -->
+    <param name="global-memory-cap-mb" value="1536"/>
+
+    <param name="reconnect-backoff-min-ms" value="250"/>
+    <param name="reconnect-backoff-max-ms" value="5000"/>
+
+    <param name="max-forks-per-call" value="4"/>
+  </settings>
+</configuration>

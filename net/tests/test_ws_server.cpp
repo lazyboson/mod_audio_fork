@@ -31,6 +31,7 @@ constexpr std::array<lws_protocols, 2> kProtocols{{
 
 std::unique_ptr<TestWsServer> TestWsServer::Start() {
   EnsureLwsLogPolicy();
+  const std::scoped_lock lifecycle(LwsLifecycleMutex());
   auto server = std::make_unique<TestWsServer>(PrivateTag{});
   lws_context_creation_info info{};
   info.port = 0;
@@ -67,6 +68,7 @@ TestWsServer::~TestWsServer() {
     thread_.join();
   }
   if (context_ != nullptr) {
+    const std::scoped_lock lifecycle(LwsLifecycleMutex());
     lws_context_destroy(context_);
   }
 }

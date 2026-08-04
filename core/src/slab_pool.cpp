@@ -21,6 +21,8 @@ SlabLease::~SlabLease() { Release(); }
 
 MutableByteSpan SlabLease::bytes() noexcept { return MutableByteSpan(storage_); }
 
+ConstByteSpan SlabLease::bytes() const noexcept { return ConstByteSpan(storage_); }
+
 // push_back cannot allocate: Create() reserved free_slabs capacity for every
 // slab the cap allows, so the noexcept below cannot be violated
 // NOLINTNEXTLINE(bugprone-exception-escape)

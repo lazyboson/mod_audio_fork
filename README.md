@@ -1,5 +1,12 @@
 # mod_audio_fork
 
+> ## 🚧 UNDER CONSTRUCTION 🚧
+>
+> **This module is not finished and must not be used in production.** It is being
+> built milestone by milestone (see [Status](#status)); playback, the load rig,
+> and the soak-test release gate are still outstanding. APIs, wire protocol, and
+> configuration may change without notice until M5 lands.
+
 Bidirectional FreeSWITCH audio-fork module over WebSockets: streams call audio
 to a WS server and plays returned audio into the call. A stability-focused
 replacement for drachtio's `mod_audio_fork`, designed for ~1,000 concurrent
@@ -15,13 +22,47 @@ cmake --preset asan && cmake --build --preset asan --parallel && ctest --preset 
 cmake --preset tsan && cmake --build --preset tsan --parallel && ctest --preset tsan
 ```
 
-Requires CMake ≥ 3.25 and a C++17 compiler. `core/` has no FreeSWITCH
-dependency and builds anywhere; the FreeSWITCH module shell arrives in M3.
+Requires CMake ≥ 3.25 and a C++17 compiler. `core/` and `net/` have no
+FreeSWITCH dependency and build anywhere.
+
+The module itself is built only where FreeSWITCH headers are present (detected
+via pkg-config, or forced with `-DAUDIOFORK_BUILD_MODULE=ON`):
+
+```sh
+cmake --preset release && cmake --build --preset release --target mod_audio_fork
+```
+
+Install `build/release/module/mod_audio_fork.so` into FreeSWITCH's module
+directory and `conf/audio_fork.conf.xml` into `conf/autoload_configs/`.
+
+## Using it
+
+```
+uuid_audio_fork <uuid> start ws://host:port/path <mono|mixed|stereo> <rate> [metadata-json]
+uuid_audio_fork <uuid> stop
+audio_fork status          # JSON counters: forks, bytes, drops, reconnects, pool use
+```
+
+Events are fired as custom events with subclass `mod_audio_fork::<name>`
+(`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`, …).
 
 ## Status
 
 - M1 (core foundation) ✅ — session state machine, SPSC ring, slab pool, with
   unit, exhaustive-interleaving, and sanitizer test suites.
-- M2 (network shim + protocol) — libwebsockets RAII event loop (`net/`),
+- M2 (network shim + protocol) ✅ — libwebsockets RAII event loop (`net/`),
   wire-protocol codec with libFuzzer harness, jittered reconnect backoff,
   echo/reconnect integration tests against an in-process mock WS server.
+- M3 (module shell + fork path) — **partially complete.** The fork path,
+  sharded runtime, and drachtio-compatible command surface are implemented and
+  covered by 100 tests green under ASan/UBSan and TSan.
+
+  Verified against a real FreeSWITCH 1.10.12: the module compiles against its
+  headers, loads and unloads cleanly, reads `audio_fork.conf.xml`, and answers
+  `uuid_audio_fork` / `audio_fork status`.
+
+  **Not yet verified:** audio flowing through a live call, and the 50-call
+  smoke run (`rig/`). Those close out with the load rig in M5. Do not deploy
+  this yet — see the banner above.
+- M4 (playback) — not started: server→caller audio, jitter buffer, barge-in.
+- M5 (chaos + soak) — not started: rig completion, nightly load tier, 48h gate.

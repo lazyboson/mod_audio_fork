@@ -12,6 +12,12 @@ set(LWS_WITH_MINIMAL_EXAMPLES OFF CACHE BOOL "" FORCE)
 # Linux-only kernel route monitoring; unused by us, and its POLLIN handler
 # races on lws globals when several contexts run on their own threads
 set(LWS_WITH_NETLINK OFF CACHE BOOL "" FORCE)
+# REQUIRED for the sharded design: lws guards its process-global bookkeeping
+# (log-context refcount, lifecycle tag list, touched by every wsi create and
+# destroy) with a mutex only when built SMP-aware. At MAX_SMP=1 those counters
+# are unguarded, and one context per shard thread corrupts them — asserting in
+# debug builds and silently miscounting in release.
+set(LWS_MAX_SMP 8 CACHE STRING "" FORCE)
 
 FetchContent_Declare(libwebsockets
   URL https://github.com/warmcat/libwebsockets/archive/refs/tags/v4.3.3.tar.gz
@@ -20,6 +26,7 @@ FetchContent_Declare(libwebsockets
 FetchContent_MakeAvailable(libwebsockets)
 
 add_library(audiofork_net STATIC
+  src/shard_pool.cpp
   src/ws_client.cpp
 )
 target_include_directories(audiofork_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

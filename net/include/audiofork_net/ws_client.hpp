@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -18,6 +19,21 @@ struct lws;
 struct lws_context;
 
 namespace audiofork::net {
+
+class WsEventLoop;
+
+// Guards lws context creation/destruction, which mutate non-atomic globals
+// shared by every context in the process. Anything else in this process that
+// creates lws contexts (FreeSWITCH's mod_verto does) is outside this guard —
+// see DESIGN.md §13.
+[[nodiscard]] std::mutex& LwsLifecycleMutex();
+
+// Owns the lws scheduler entry backing the repeating tick; defined in the
+// implementation so lws types stay out of this header.
+struct TickHandle;
+[[nodiscard]] TickHandle* CreateTickHandle(WsEventLoop& loop, lws_context* context,
+                                           std::chrono::milliseconds interval);
+void DestroyTickHandle(TickHandle* handle);
 
 void EnsureLwsLogPolicy();
 
@@ -94,13 +110,25 @@ class WsEventLoop {
   void Stop();
   void Post(std::function<void()> task);
 
+  // Repeating wake-up that drives per-session pumping; also the granularity at
+  // which ScheduleTimer deadlines are honoured. Loop-thread or pre-Run only.
+  void SetTick(std::chrono::milliseconds interval, std::function<void()> on_tick);
+  void ScheduleTimer(std::chrono::milliseconds delay, std::function<void()> task);
+
   [[nodiscard]] WsConnection* Connect(const WsEndpoint& endpoint, WsConnectionHandler& handler,
                                       std::size_t max_queued_bytes);
 
   [[nodiscard]] int HandleLws(lws* wsi, int reason, void* user, void* in, std::size_t len);
+  void OnTick();
 
  private:
+  struct PendingTimer {
+    std::chrono::steady_clock::time_point deadline;
+    std::function<void()> task;
+  };
+
   void DrainPosted();
+  void DrainDueTimers();
   void FinishConnection(WsConnection& connection, bool connect_failed);
 
   lws_context* context_ = nullptr;
@@ -108,6 +136,10 @@ class WsEventLoop {
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;
   std::unordered_map<WsConnection*, std::unique_ptr<WsConnection>> connections_;
+  std::function<void()> on_tick_;
+  std::chrono::milliseconds tick_interval_{0};
+  std::vector<PendingTimer> timers_;
+  std::unique_ptr<TickHandle, decltype(&DestroyTickHandle)> tick_{nullptr, &DestroyTickHandle};
 };
 
 }  // namespace audiofork::net

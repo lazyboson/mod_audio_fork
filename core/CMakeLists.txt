@@ -7,7 +7,10 @@ FetchContent_Declare(nlohmann_json
 FetchContent_MakeAvailable(nlohmann_json)
 
 add_library(audiofork_core STATIC
+  src/config.cpp
+  src/fork_session.cpp
   src/protocol.cpp
+  src/send_buffer.cpp
   src/slab_pool.cpp
 )
 target_include_directories(audiofork_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

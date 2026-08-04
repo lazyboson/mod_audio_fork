@@ -1,0 +1,572 @@
+// FreeSWITCH glue only: parameter parsing, media-bug plumbing, event emission.
+// Every decision that can be tested without FreeSWITCH lives in core/
+// (CONSTITUTION Article 7.3).
+#include <switch.h>
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "audiofork/config.hpp"
+#include "audiofork/fork_session.hpp"
+#include "audiofork/ports.hpp"
+#include "audiofork/slab_pool.hpp"
+#include "audiofork_net/shard_pool.hpp"
+
+using audiofork::AudioFormat;
+using audiofork::Clock;
+using audiofork::ConstByteSpan;
+using audiofork::Endpoint;
+using audiofork::EventSink;
+using audiofork::ForkEvent;
+using audiofork::ForkEventType;
+using audiofork::ForkParams;
+using audiofork::ForkSession;
+using audiofork::MixType;
+using audiofork::ModuleConfig;
+using audiofork::SlabPool;
+using audiofork::SystemClock;
+using audiofork::net::ShardPool;
+
+namespace {
+
+constexpr const char* kEventSubclassPrefix = "mod_audio_fork::";
+constexpr const char* kPrivateKey = "mod_audio_fork";
+
+const char* EventName(ForkEventType type) {
+  switch (type) {
+    case ForkEventType::kConnect:
+      return "connect";
+    case ForkEventType::kConnectFailed:
+      return "connect_failed";
+    case ForkEventType::kReconnecting:
+      return "reconnecting";
+    case ForkEventType::kResume:
+      return "resume";
+    case ForkEventType::kOverrun:
+      return "overrun";
+    case ForkEventType::kDegraded:
+      return "degraded";
+    case ForkEventType::kJson:
+      return "json";
+    case ForkEventType::kJsonError:
+      return "json_error";
+    case ForkEventType::kDisconnect:
+      return "disconnect";
+    case ForkEventType::kStop:
+      return "stop";
+    case ForkEventType::kError:
+      return "error";
+  }
+  return "error";
+}
+
+class FsEventSink : public EventSink {
+ public:
+  void Emit(const ForkEvent& event) override {
+    switch_event_t* fs_event = nullptr;
+    const std::string subclass = std::string(kEventSubclassPrefix) + EventName(event.type);
+    if (switch_event_create_subclass(&fs_event, SWITCH_EVENT_CUSTOM, subclass.c_str()) !=
+        SWITCH_STATUS_SUCCESS) {
+      return;
+    }
+    switch_event_add_header_string(fs_event, SWITCH_STACK_BOTTOM, "Unique-ID",
+                                   event.call_uuid.c_str());
+    switch_event_add_header_string(fs_event, SWITCH_STACK_BOTTOM, "Fork-ID", event.fork_id.c_str());
+    if (!event.detail.empty()) {
+      switch_event_add_header_string(fs_event, SWITCH_STACK_BOTTOM, "Detail", event.detail.c_str());
+    }
+    if (event.gap_ms != 0) {
+      switch_event_add_header(fs_event, SWITCH_STACK_BOTTOM, "Gap-Ms", "%llu",
+                              static_cast<unsigned long long>(event.gap_ms));
+    }
+    if (event.dropped_ms != 0) {
+      switch_event_add_header(fs_event, SWITCH_STACK_BOTTOM, "Dropped-Ms", "%llu",
+                              static_cast<unsigned long long>(event.dropped_ms));
+    }
+    switch_event_fire(&fs_event);
+  }
+};
+
+// Per-media-bug state. Owned by the bug's user_data (a raw pointer, the C ABI's
+// currency) and destroyed only on the bug's CLOSE callback.
+struct ForkBug {
+  std::shared_ptr<ForkSession> session;
+  AudioFormat wire_format;
+  std::uint32_t session_rate = 0;
+  switch_audio_resampler_t* resampler = nullptr;
+  std::vector<std::int16_t> scratch;
+};
+
+// The composition root: exactly one of each, created at load and destroyed at
+// unload in reverse order (CONSTITUTION Article 4.1-4.2).
+struct ModuleState {
+  ModuleConfig config;
+  std::unique_ptr<SlabPool> pool;
+  std::unique_ptr<ShardPool> shards;
+  FsEventSink events;
+  SystemClock clock;
+
+  std::mutex registry_mutex;
+  std::unordered_map<std::string, std::vector<std::shared_ptr<ForkSession>>> registry;
+};
+
+ModuleState* g_state = nullptr;
+
+ModuleConfig LoadConfig() {
+  ModuleConfig config;
+  switch_xml_t xml = nullptr;
+  switch_xml_t cfg = nullptr;
+  if ((xml = switch_xml_open_cfg("audio_fork.conf", &cfg, nullptr)) == nullptr) {
+    return audiofork::SanitizeConfig(config);
+  }
+  if (switch_xml_t settings = switch_xml_child(cfg, "settings"); settings != nullptr) {
+    for (switch_xml_t param = switch_xml_child(settings, "param"); param != nullptr;
+         param = param->next) {
+      const char* name = switch_xml_attr_soft(param, "name");
+      const char* value = switch_xml_attr_soft(param, "value");
+      if (name == nullptr || value == nullptr) {
+        continue;
+      }
+      const int number = atoi(value);
+      if (!strcasecmp(name, "shard-count")) {
+        config.shard_count = static_cast<std::size_t>(std::max(number, 0));
+      } else if (!strcasecmp(name, "send-buffer-seconds")) {
+        config.send_buffer = std::chrono::milliseconds{number * 1000};
+      } else if (!strcasecmp(name, "coalesce-max-ms")) {
+        config.coalesce_max = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "global-memory-cap-mb")) {
+        config.global_memory_cap_bytes =
+            static_cast<std::size_t>(std::max(number, 1)) * 1024 * 1024;
+      } else if (!strcasecmp(name, "reconnect-backoff-min-ms")) {
+        config.reconnect_min = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "reconnect-backoff-max-ms")) {
+        config.reconnect_max = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "max-forks-per-call")) {
+        config.max_forks_per_call = static_cast<std::size_t>(std::max(number, 1));
+      }
+    }
+  }
+  switch_xml_free(xml);
+  return audiofork::SanitizeConfig(config);
+}
+
+bool ParseEndpoint(const char* url, Endpoint& endpoint, std::string& error) {
+  if (url == nullptr) {
+    error = "missing url";
+    return false;
+  }
+  std::string text(url);
+  if (text.rfind("wss://", 0) == 0) {
+    endpoint.tls = true;
+    text.erase(0, 6);
+  } else if (text.rfind("ws://", 0) == 0) {
+    endpoint.tls = false;
+    text.erase(0, 5);
+  } else {
+    error = "url must start with ws:// or wss://";
+    return false;
+  }
+  const std::size_t slash = text.find('/');
+  std::string authority = text.substr(0, slash);
+  endpoint.path = slash == std::string::npos ? "/" : text.substr(slash);
+  const std::size_t colon = authority.rfind(':');
+  if (colon != std::string::npos) {
+    endpoint.port = static_cast<std::uint16_t>(atoi(authority.substr(colon + 1).c_str()));
+    authority.erase(colon);
+  } else {
+    endpoint.port = endpoint.tls ? 443 : 80;
+  }
+  endpoint.host = authority;
+  if (endpoint.host.empty() || endpoint.port == 0) {
+    error = "url has no host or port";
+    return false;
+  }
+  if (endpoint.tls) {
+    // TLS lands with the vendored-lws build in M5; refusing beats silently
+    // streaming call audio in the clear
+    error = "wss:// is not supported yet in this build";
+    return false;
+  }
+  return true;
+}
+
+bool ParseMixType(const char* text, MixType& mix, std::string& error) {
+  if (text == nullptr || !strcasecmp(text, "mono")) {
+    mix = MixType::kMono;
+    return true;
+  }
+  if (!strcasecmp(text, "mixed")) {
+    mix = MixType::kMixed;
+    return true;
+  }
+  if (!strcasecmp(text, "stereo")) {
+    mix = MixType::kStereo;
+    return true;
+  }
+  error = "mix-type must be mono, mixed or stereo";
+  return false;
+}
+
+ForkSession::Tuning MakeTuning(const ModuleConfig& config, const AudioFormat& format) {
+  ForkSession::Tuning tuning;
+  tuning.send_cap_bytes = format.BytesForDuration(config.send_buffer);
+  tuning.handoff_bytes = format.BytesForDuration(config.handoff_buffer);
+  tuning.coalesce_max_bytes = format.BytesForDuration(config.coalesce_max);
+  tuning.drain_timeout = config.drain_timeout;
+  tuning.backoff = {config.reconnect_min, config.reconnect_max, 2.0, 0.25};
+  return tuning;
+}
+
+void PushResampled(ForkBug& bug, const std::int16_t* samples, std::size_t sample_count) {
+  if (bug.resampler == nullptr) {
+    // a rejected push is counted as a media drop inside the session
+    (void)bug.session->PushAudio(ConstByteSpan(reinterpret_cast<const std::uint8_t*>(samples),
+                                               sample_count * sizeof(std::int16_t)));
+    return;
+  }
+  switch_resample_process(bug.resampler, const_cast<std::int16_t*>(samples),
+                          static_cast<uint32_t>(sample_count));
+  if (bug.resampler->to_len == 0) {
+    return;
+  }
+  (void)bug.session->PushAudio(
+      ConstByteSpan(reinterpret_cast<const std::uint8_t*>(bug.resampler->to),
+                    static_cast<std::size_t>(bug.resampler->to_len) * sizeof(std::int16_t)));
+}
+
+switch_bool_t OnMediaBug(switch_media_bug_t* bug, void* user_data, switch_abc_type_t type) {
+  auto* state = static_cast<ForkBug*>(user_data);
+  switch (type) {
+    case SWITCH_ABC_TYPE_INIT:
+      return SWITCH_TRUE;
+
+    case SWITCH_ABC_TYPE_READ: {
+      switch_frame_t frame = {};
+      frame.data = state->scratch.data();
+      frame.buflen = static_cast<uint32_t>(state->scratch.size() * sizeof(std::int16_t));
+      while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+        if (frame.datalen == 0) {
+          break;
+        }
+        PushResampled(*state, static_cast<const std::int16_t*>(frame.data),
+                      frame.datalen / sizeof(std::int16_t));
+      }
+      return SWITCH_TRUE;
+    }
+
+    case SWITCH_ABC_TYPE_CLOSE:
+      // the media bug's reference: stop the fork, then let the shard's
+      // reference carry it through close (DESIGN.md §4)
+      if (state->session) {
+        state->session->Stop();
+      }
+      if (state->resampler != nullptr) {
+        switch_resample_destroy(&state->resampler);
+      }
+      delete state;
+      return SWITCH_TRUE;
+
+    default:
+      return SWITCH_TRUE;
+  }
+}
+
+void ForgetFork(const std::string& uuid, const std::shared_ptr<ForkSession>& session) {
+  const std::scoped_lock lock(g_state->registry_mutex);
+  auto it = g_state->registry.find(uuid);
+  if (it == g_state->registry.end()) {
+    return;
+  }
+  auto& forks = it->second;
+  forks.erase(std::remove(forks.begin(), forks.end(), session), forks.end());
+  if (forks.empty()) {
+    g_state->registry.erase(it);
+  }
+}
+
+switch_status_t StartFork(switch_core_session_t* session, const char* url, const char* mix_text,
+                          const char* rate_text, const char* metadata, std::string& error) {
+  switch_channel_t* channel = switch_core_session_get_channel(session);
+  const std::string uuid = switch_core_session_get_uuid(session);
+
+  Endpoint endpoint;
+  MixType mix = MixType::kMono;
+  if (!ParseEndpoint(url, endpoint, error) || !ParseMixType(mix_text, mix, error)) {
+    return SWITCH_STATUS_FALSE;
+  }
+
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    const auto it = g_state->registry.find(uuid);
+    if (it != g_state->registry.end() && it->second.size() >= g_state->config.max_forks_per_call) {
+      error = "max forks per call reached";
+      return SWITCH_STATUS_FALSE;
+    }
+  }
+
+  switch_codec_implementation_t read_impl = {};
+  switch_core_session_get_read_impl(session, &read_impl);
+  const std::uint32_t session_rate = read_impl.actual_samples_per_second;
+
+  AudioFormat wire_format;
+  wire_format.sample_rate = rate_text != nullptr && atoi(rate_text) > 0
+                                ? static_cast<std::uint32_t>(atoi(rate_text))
+                                : session_rate;
+  wire_format.channels = mix == MixType::kStereo ? 2 : 1;
+
+  ForkParams params;
+  params.call_uuid = uuid;
+  params.fork_id =
+      switch_core_session_sprintf(session, "%s-%d", uuid.c_str(), switch_epoch_time_now(nullptr));
+  params.endpoint = endpoint;
+  params.format = wire_format;
+  params.mix_type = mix;
+  params.metadata_json = metadata == nullptr ? "" : metadata;
+
+  auto fork = g_state->shards->StartFork(params, MakeTuning(g_state->config, wire_format),
+                                         g_state->events, g_state->clock);
+  if (fork == nullptr) {
+    error = "fork could not be created";
+    return SWITCH_STATUS_FALSE;
+  }
+  fork->set_on_finished([uuid, weak = std::weak_ptr<ForkSession>(fork)] {
+    if (auto session = weak.lock()) {
+      ForgetFork(uuid, session);
+    }
+  });
+
+  auto bug_state = std::make_unique<ForkBug>();
+  bug_state->session = fork;
+  bug_state->wire_format = wire_format;
+  bug_state->session_rate = session_rate;
+  bug_state->scratch.resize(SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(std::int16_t));
+  if (wire_format.sample_rate != session_rate) {
+    if (switch_resample_create(
+            &bug_state->resampler, session_rate, wire_format.sample_rate,
+            static_cast<uint32_t>(bug_state->scratch.size() * sizeof(std::int16_t)),
+            SWITCH_RESAMPLE_QUALITY, 1) != SWITCH_STATUS_SUCCESS) {
+      fork->Stop();
+      error = "resampler could not be created";
+      return SWITCH_STATUS_FALSE;
+    }
+  }
+
+  switch_media_bug_flag_t flags = SMBF_READ_STREAM;
+  if (mix != MixType::kMono) {
+    flags |= SMBF_WRITE_STREAM;
+  }
+  if (mix == MixType::kStereo) {
+    flags |= SMBF_STEREO;
+  }
+
+  switch_media_bug_t* bug = nullptr;
+  ForkBug* raw_bug_state = bug_state.get();
+  if (switch_core_media_bug_add(session, "audio_fork", nullptr, OnMediaBug, raw_bug_state, 0, flags,
+                                &bug) != SWITCH_STATUS_SUCCESS) {
+    fork->Stop();
+    error = "media bug could not be added";
+    return SWITCH_STATUS_FALSE;
+  }
+  // ownership handed to the bug: released in its CLOSE callback
+  (void)bug_state.release();
+  switch_channel_set_private(channel, kPrivateKey, bug);
+
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    g_state->registry[uuid].push_back(std::move(fork));
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t StopForks(switch_core_session_t* session) {
+  switch_channel_t* channel = switch_core_session_get_channel(session);
+  const std::string uuid = switch_core_session_get_uuid(session);
+
+  std::vector<std::shared_ptr<ForkSession>> forks;
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    const auto it = g_state->registry.find(uuid);
+    if (it == g_state->registry.end()) {
+      return SWITCH_STATUS_FALSE;
+    }
+    forks = it->second;
+  }
+  for (auto& fork : forks) {
+    fork->Stop();
+  }
+  if (auto* bug =
+          static_cast<switch_media_bug_t*>(switch_channel_get_private(channel, kPrivateKey));
+      bug != nullptr) {
+    switch_channel_set_private(channel, kPrivateKey, nullptr);
+    switch_core_media_bug_remove(session, &bug);
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" {
+
+SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load);
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown);
+SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shutdown, nullptr);
+
+#define AUDIO_FORK_API_SYNTAX \
+  "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> send_text <json>"
+
+SWITCH_STANDARD_API(uuid_audio_fork_api) {
+  (void)session;
+  if (zstr(cmd)) {
+    stream->write_function(stream, "-ERR usage: %s\n", AUDIO_FORK_API_SYNTAX);
+    return SWITCH_STATUS_SUCCESS;
+  }
+  char* mycmd = strdup(cmd);
+  std::array<char*, 6> argv{};
+  const int argc =
+      switch_separate_string(mycmd, ' ', argv.data(), static_cast<unsigned>(argv.size()));
+  if (argc < 2) {
+    stream->write_function(stream, "-ERR usage: %s\n", AUDIO_FORK_API_SYNTAX);
+    free(mycmd);
+    return SWITCH_STATUS_SUCCESS;
+  }
+
+  switch_core_session_t* target = switch_core_session_locate(argv[0]);
+  if (target == nullptr) {
+    stream->write_function(stream, "-ERR no such channel %s\n", argv[0]);
+    free(mycmd);
+    return SWITCH_STATUS_SUCCESS;
+  }
+
+  std::string error;
+  switch_status_t status = SWITCH_STATUS_FALSE;
+  if (!strcasecmp(argv[1], "start")) {
+    status = StartFork(target, argc > 2 ? argv[2] : nullptr, argc > 3 ? argv[3] : nullptr,
+                       argc > 4 ? argv[4] : nullptr, argc > 5 ? argv[5] : nullptr, error);
+  } else if (!strcasecmp(argv[1], "stop")) {
+    status = StopForks(target);
+    if (status != SWITCH_STATUS_SUCCESS) {
+      error = "no fork running on this channel";
+    }
+  } else if (!strcasecmp(argv[1], "send_text")) {
+    // the outbound app-text path arrives with playback in M4
+    error = "send_text is not supported yet in this build";
+  } else {
+    error = "unknown subcommand";
+  }
+
+  switch_core_session_rwunlock(target);
+  free(mycmd);
+
+  if (status == SWITCH_STATUS_SUCCESS) {
+    stream->write_function(stream, "+OK\n");
+  } else {
+    stream->write_function(stream, "-ERR %s\n", error.empty() ? "failed" : error.c_str());
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+SWITCH_STANDARD_API(audio_fork_status_api) {
+  (void)cmd;
+  (void)session;
+  std::size_t calls = 0;
+  std::size_t forks = 0;
+  std::uint64_t media_dropped = 0;
+  std::uint64_t buffer_dropped = 0;
+  std::uint64_t sent = 0;
+  std::uint64_t reconnects = 0;
+  std::size_t buffered = 0;
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    calls = g_state->registry.size();
+    for (const auto& [uuid, sessions] : g_state->registry) {
+      forks += sessions.size();
+      for (const auto& fork : sessions) {
+        const ForkSession::Stats stats = fork->stats();
+        media_dropped += stats.media_dropped_bytes;
+        buffer_dropped += stats.buffer_dropped_bytes;
+        sent += stats.sent_bytes;
+        reconnects += stats.reconnects;
+        buffered += stats.buffered_bytes;
+      }
+    }
+  }
+  const SlabPool::Stats pool = g_state->pool->stats();
+  stream->write_function(
+      stream,
+      "{\"calls\":%lu,\"forks\":%lu,\"shards\":%lu,\"sent_bytes\":%llu,"
+      "\"media_dropped_bytes\":%llu,\"buffer_dropped_bytes\":%llu,\"reconnects\":%llu,"
+      "\"buffered_bytes\":%lu,\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
+      static_cast<unsigned long>(calls), static_cast<unsigned long>(forks),
+      static_cast<unsigned long>(g_state->shards->shard_count()),
+      static_cast<unsigned long long>(sent), static_cast<unsigned long long>(media_dropped),
+      static_cast<unsigned long long>(buffer_dropped), static_cast<unsigned long long>(reconnects),
+      static_cast<unsigned long>(buffered), static_cast<unsigned long>(pool.allocated_bytes),
+      static_cast<unsigned long>(pool.leased_slabs));
+  return SWITCH_STATUS_SUCCESS;
+}
+
+SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load) {
+  *module_interface = switch_loadable_module_create_module_interface(pool, modname);
+
+  auto state = std::make_unique<ModuleState>();
+  state->config = LoadConfig();
+
+  auto slabs =
+      SlabPool::Create({state->config.slab_size_bytes, state->config.global_memory_cap_bytes});
+  if (!slabs.has_value()) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                      "mod_audio_fork: slab pool could not be created\n");
+    return SWITCH_STATUS_FALSE;
+  }
+  state->pool = std::make_unique<SlabPool>(*std::move(slabs));
+  state->shards = ShardPool::Start(state->config, *state->pool);
+  if (state->shards == nullptr) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                      "mod_audio_fork: shard pool could not be started\n");
+    return SWITCH_STATUS_FALSE;
+  }
+
+  switch_api_interface_t* api = nullptr;
+  SWITCH_ADD_API(api, "uuid_audio_fork", "fork call audio to a websocket server",
+                 uuid_audio_fork_api, AUDIO_FORK_API_SYNTAX);
+  SWITCH_ADD_API(api, "audio_fork", "mod_audio_fork counters as JSON", audio_fork_status_api,
+                 "status");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid start");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid stop");
+
+  g_state = state.release();
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+                    "mod_audio_fork loaded: %lu shards, %lus send buffer\n",
+                    static_cast<unsigned long>(g_state->shards->shard_count()),
+                    static_cast<unsigned long>(g_state->config.send_buffer.count() / 1000));
+  return SWITCH_STATUS_SUCCESS;
+}
+
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown) {
+  if (g_state == nullptr) {
+    return SWITCH_STATUS_SUCCESS;
+  }
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    for (auto& [uuid, sessions] : g_state->registry) {
+      for (auto& fork : sessions) {
+        fork->Stop();
+      }
+    }
+  }
+  // reverse construction order: shards (and their threads) before the pool
+  // they lease slabs from
+  std::unique_ptr<ModuleState> state(g_state);
+  g_state = nullptr;
+  state->shards.reset();
+  state->pool.reset();
+  return SWITCH_STATUS_SUCCESS;
+}
+
+}  // extern "C"

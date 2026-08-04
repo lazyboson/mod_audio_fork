@@ -1,4 +1,5 @@
 add_executable(audiofork_net_tests
+  shard_pool_test.cpp
   test_ws_server.cpp
   ws_client_test.cpp
 )

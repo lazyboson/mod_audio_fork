@@ -7,7 +7,10 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(audiofork_core_tests
   backoff_test.cpp
+  config_test.cpp
+  fork_session_test.cpp
   protocol_test.cpp
+  send_buffer_test.cpp
   session_interleave_test.cpp
   session_state_test.cpp
   slab_pool_test.cpp

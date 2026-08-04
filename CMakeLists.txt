@@ -12,8 +12,22 @@ target_compile_options(audiofork_warnings INTERFACE -Wall -Wextra -Werror -Wshad
 option(AUDIOFORK_FUZZ "Build libFuzzer targets (requires clang)" OFF)
 option(AUDIOFORK_BUILD_NET "Build the libwebsockets shim" ON)
 
+# The module needs FreeSWITCH headers; default to building it only where they
+# are present so core/ and net/ stay buildable anywhere.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(FREESWITCH_PROBE QUIET freeswitch)
+endif()
+option(AUDIOFORK_BUILD_MODULE "Build the FreeSWITCH module" ${FREESWITCH_PROBE_FOUND})
+
 include(CTest)
 add_subdirectory(core)
 if(AUDIOFORK_BUILD_NET)
   add_subdirectory(net)
+endif()
+if(AUDIOFORK_BUILD_MODULE)
+  if(NOT AUDIOFORK_BUILD_NET)
+    message(FATAL_ERROR "AUDIOFORK_BUILD_MODULE requires AUDIOFORK_BUILD_NET")
+  endif()
+  add_subdirectory(module)
 endif()
