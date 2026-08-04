@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -27,6 +28,7 @@ enum class Item : std::uint8_t {
   kCloseOutcome,
   kTeardown,
 };
+constexpr std::size_t kItemCount = 5;
 
 std::vector<E> EventsFor(Item item) {
   switch (item) {
@@ -64,15 +66,26 @@ struct Config {
   S state = S::kConnecting;
   int finalize_count = 0;
   int retry_budget = 3;
-  std::vector<Item> pending;
+  std::array<int, kItemCount> pending{};
+
+  void Add(Item item) { ++pending[static_cast<std::size_t>(item)]; }
+
+  [[nodiscard]] bool NothingPending() const {
+    for (const int count : pending) {
+      if (count > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   [[nodiscard]] std::string Encode() const {
     std::string key;
     key += static_cast<char>('a' + static_cast<int>(state));
     key += static_cast<char>('a' + finalize_count);
     key += static_cast<char>('a' + retry_budget);
-    for (const Item item : pending) {
-      key += static_cast<char>('a' + static_cast<int>(item));
+    for (const int count : pending) {
+      key += static_cast<char>('a' + count);
     }
     return key;
   }
@@ -89,41 +102,41 @@ void Explore(const Config& config, std::set<std::string>& visited, ExplorationSt
   }
   ++stats.configs;
 
-  if (config.pending.empty()) {
+  if (config.NothingPending()) {
     ++stats.terminals;
     EXPECT_EQ(config.state, S::kDead) << "stuck in a non-terminal state with nothing pending";
     EXPECT_EQ(config.finalize_count, 1);
     return;
   }
 
-  for (std::size_t i = 0; i < config.pending.size(); ++i) {
-    if (i > 0 && config.pending[i] == config.pending[i - 1]) {
+  for (std::size_t i = 0; i < kItemCount; ++i) {
+    if (config.pending[i] == 0) {
       continue;
     }
-    for (const E event : EventsFor(config.pending[i])) {
+    for (const E event : EventsFor(static_cast<Item>(i))) {
       const SessionTransition transition = SessionTransitionFor(config.state, event);
       EXPECT_LE(TeardownRank(config.state), TeardownRank(transition.next))
           << "teardown progress must be monotonic";
 
       Config next = config;
-      next.pending.erase(next.pending.begin() + static_cast<std::ptrdiff_t>(i));
+      --next.pending[i];
       next.state = transition.next;
 
       switch (transition.action) {
         case A::kBeginConnect:
-          next.pending.push_back(Item::kAttemptOutcome);
+          next.Add(Item::kAttemptOutcome);
           break;
         case A::kScheduleRetry:
           if (next.retry_budget > 0) {
             --next.retry_budget;
-            next.pending.push_back(Item::kRetryTimer);
+            next.Add(Item::kRetryTimer);
           }
           break;
         case A::kBeginDrain:
-          next.pending.push_back(Item::kDrainOutcome);
+          next.Add(Item::kDrainOutcome);
           break;
         case A::kBeginClose:
-          next.pending.push_back(Item::kCloseOutcome);
+          next.Add(Item::kCloseOutcome);
           break;
         case A::kFinalize:
           ++next.finalize_count;
@@ -136,7 +149,6 @@ void Explore(const Config& config, std::set<std::string>& visited, ExplorationSt
       }
       EXPECT_LE(next.finalize_count, 1) << "finalize fired twice";
 
-      std::sort(next.pending.begin(), next.pending.end());
       Explore(next, visited, stats);
     }
   }
@@ -144,8 +156,8 @@ void Explore(const Config& config, std::set<std::string>& visited, ExplorationSt
 
 TEST(SessionInterleavings, EveryDeliveryOrderTerminatesDeadWithOneFinalize) {
   Config initial;
-  initial.pending = {Item::kAttemptOutcome, Item::kTeardown};
-  std::sort(initial.pending.begin(), initial.pending.end());
+  initial.Add(Item::kAttemptOutcome);
+  initial.Add(Item::kTeardown);
 
   std::set<std::string> visited;
   ExplorationStats stats;
@@ -156,13 +168,13 @@ TEST(SessionInterleavings, EveryDeliveryOrderTerminatesDeadWithOneFinalize) {
   RecordProperty("terminal_configs", stats.terminals);
 }
 
-// Same exhaustive exploration, but teardown arrives only after the session has
-// been through the full reconnect budget — exercises the late-teardown tail.
+// Same exhaustive exploration, but with no reconnect budget at all — exercises
+// the tail where teardown is the only way out of kReconnecting.
 TEST(SessionInterleavings, TeardownAfterReconnectExhaustionStillTerminates) {
   Config initial;
   initial.retry_budget = 0;
-  initial.pending = {Item::kAttemptOutcome, Item::kTeardown};
-  std::sort(initial.pending.begin(), initial.pending.end());
+  initial.Add(Item::kAttemptOutcome);
+  initial.Add(Item::kTeardown);
 
   std::set<std::string> visited;
   ExplorationStats stats;
