@@ -3,8 +3,10 @@
 // (CONSTITUTION Article 7.3).
 #include <switch.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +31,7 @@ using audiofork::ForkParams;
 using audiofork::ForkSession;
 using audiofork::MixType;
 using audiofork::ModuleConfig;
+using audiofork::MutableByteSpan;
 using audiofork::SlabPool;
 using audiofork::SystemClock;
 using audiofork::net::ShardPool;
@@ -62,6 +65,14 @@ const char* EventName(ForkEventType type) {
       return "stop";
     case ForkEventType::kError:
       return "error";
+    case ForkEventType::kPlaybackStart:
+      return "playback_start";
+    case ForkEventType::kPlaybackStop:
+      return "playback_stop";
+    case ForkEventType::kPlaybackCleared:
+      return "playback_cleared";
+    case ForkEventType::kMark:
+      return "mark";
   }
   return "error";
 }
@@ -100,7 +111,10 @@ struct ForkBug {
   AudioFormat wire_format;
   std::uint32_t session_rate = 0;
   switch_audio_resampler_t* resampler = nullptr;
+  switch_audio_resampler_t* playback_resampler = nullptr;
+  std::uint32_t playback_resampler_rate = 0;
   std::vector<std::int16_t> scratch;
+  std::vector<std::int16_t> playback_scratch;
 };
 
 // The composition root: exactly one of each, created at load and destroyed at
@@ -138,6 +152,10 @@ ModuleConfig LoadConfig() {
         config.shard_count = static_cast<std::size_t>(std::max(number, 0));
       } else if (!strcasecmp(name, "send-buffer-seconds")) {
         config.send_buffer = std::chrono::milliseconds{number * 1000};
+      } else if (!strcasecmp(name, "playback-high-watermark-ms")) {
+        config.playback_high_watermark = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "playback-low-watermark-ms")) {
+        config.playback_low_watermark = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "coalesce-max-ms")) {
         config.coalesce_max = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "global-memory-cap-mb")) {
@@ -220,7 +238,42 @@ ForkSession::Tuning MakeTuning(const ModuleConfig& config, const AudioFormat& fo
   tuning.coalesce_max_bytes = format.BytesForDuration(config.coalesce_max);
   tuning.drain_timeout = config.drain_timeout;
   tuning.backoff = {config.reconnect_min, config.reconnect_max, 2.0, 0.25};
+  // playback is sized in mono at the fork rate: the server sends one stream for
+  // the caller's ear regardless of how many channels we fork out
+  const AudioFormat playback_format{format.sample_rate, 1};
+  tuning.playback_high_watermark_bytes =
+      playback_format.BytesForDuration(config.playback_high_watermark);
+  tuning.playback_low_watermark_bytes =
+      playback_format.BytesForDuration(config.playback_low_watermark);
+  tuning.playback_handoff_bytes = playback_format.BytesForDuration(config.coalesce_max);
   return tuning;
+}
+
+// Playback arrives at whatever rate the server declared; FreeSWITCH needs the
+// session rate. Rebuilt if the server changes rate mid-call.
+bool EnsurePlaybackResampler(ForkBug& bug, std::uint32_t from_rate) {
+  if (from_rate == bug.session_rate) {
+    if (bug.playback_resampler != nullptr) {
+      switch_resample_destroy(&bug.playback_resampler);
+      bug.playback_resampler_rate = 0;
+    }
+    return true;
+  }
+  if (bug.playback_resampler != nullptr && bug.playback_resampler_rate == from_rate) {
+    return true;
+  }
+  if (bug.playback_resampler != nullptr) {
+    switch_resample_destroy(&bug.playback_resampler);
+  }
+  if (switch_resample_create(
+          &bug.playback_resampler, static_cast<int>(from_rate), static_cast<int>(bug.session_rate),
+          static_cast<uint32_t>(bug.playback_scratch.size() * sizeof(std::int16_t)),
+          SWITCH_RESAMPLE_QUALITY, 1) != SWITCH_STATUS_SUCCESS) {
+    bug.playback_resampler_rate = 0;
+    return false;
+  }
+  bug.playback_resampler_rate = from_rate;
+  return true;
 }
 
 void PushResampled(ForkBug& bug, const std::int16_t* samples, std::size_t sample_count) {
@@ -260,6 +313,53 @@ switch_bool_t OnMediaBug(switch_media_bug_t* bug, void* user_data, switch_abc_ty
       return SWITCH_TRUE;
     }
 
+    case SWITCH_ABC_TYPE_WRITE_REPLACE: {
+      if (!state->session->playback_enabled()) {
+        return SWITCH_TRUE;
+      }
+      switch_frame_t* frame = switch_core_media_bug_get_write_replace_frame(bug);
+      if (frame == nullptr || frame->data == nullptr || frame->datalen == 0) {
+        return SWITCH_TRUE;
+      }
+      const AudioFormat format = state->session->playback_format();
+      if (!EnsurePlaybackResampler(*state, format.sample_rate)) {
+        return SWITCH_TRUE;
+      }
+
+      if (state->playback_resampler == nullptr) {
+        // rates match: fill in place, leaving any tail untouched so live call
+        // audio is never overwritten with silence
+        const std::size_t filled = state->session->ReadPlayback(
+            MutableByteSpan(static_cast<std::uint8_t*>(frame->data), frame->datalen));
+        if (filled > 0) {
+          switch_core_media_bug_set_write_replace_frame(bug, frame);
+        }
+        return SWITCH_TRUE;
+      }
+
+      const std::size_t wanted = std::max<std::size_t>(
+          (static_cast<std::size_t>(frame->datalen) * format.sample_rate) / state->session_rate,
+          sizeof(std::int16_t));
+      const std::size_t capacity = state->playback_scratch.size() * sizeof(std::int16_t);
+      const std::size_t filled = state->session->ReadPlayback(
+          MutableByteSpan(reinterpret_cast<std::uint8_t*>(state->playback_scratch.data()),
+                          std::min(wanted, capacity)));
+      if (filled == 0) {
+        return SWITCH_TRUE;
+      }
+      switch_resample_process(state->playback_resampler, state->playback_scratch.data(),
+                              static_cast<uint32_t>(filled / sizeof(std::int16_t)));
+      if (state->playback_resampler->to_len == 0) {
+        return SWITCH_TRUE;
+      }
+      const std::size_t produced = std::min(
+          static_cast<std::size_t>(state->playback_resampler->to_len) * sizeof(std::int16_t),
+          static_cast<std::size_t>(frame->datalen));
+      std::memcpy(frame->data, state->playback_resampler->to, produced);
+      switch_core_media_bug_set_write_replace_frame(bug, frame);
+      return SWITCH_TRUE;
+    }
+
     case SWITCH_ABC_TYPE_CLOSE:
       // the media bug's reference: stop the fork, then let the shard's
       // reference carry it through close (DESIGN.md §4)
@@ -268,6 +368,9 @@ switch_bool_t OnMediaBug(switch_media_bug_t* bug, void* user_data, switch_abc_ty
       }
       if (state->resampler != nullptr) {
         switch_resample_destroy(&state->resampler);
+      }
+      if (state->playback_resampler != nullptr) {
+        switch_resample_destroy(&state->playback_resampler);
       }
       delete state;
       return SWITCH_TRUE;
@@ -346,6 +449,7 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
   bug_state->wire_format = wire_format;
   bug_state->session_rate = session_rate;
   bug_state->scratch.resize(SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(std::int16_t));
+  bug_state->playback_scratch.resize(SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(std::int16_t));
   if (wire_format.sample_rate != session_rate) {
     if (switch_resample_create(
             &bug_state->resampler, session_rate, wire_format.sample_rate,
@@ -357,7 +461,8 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
     }
   }
 
-  switch_media_bug_flag_t flags = SMBF_READ_STREAM;
+  // WRITE_REPLACE is what puts server audio in the caller's ear
+  switch_media_bug_flag_t flags = SMBF_READ_STREAM | SMBF_WRITE_REPLACE;
   if (mix != MixType::kMono) {
     flags |= SMBF_WRITE_STREAM;
   }
@@ -481,6 +586,8 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
   std::uint64_t sent = 0;
   std::uint64_t reconnects = 0;
   std::size_t buffered = 0;
+  std::uint64_t playback_played = 0;
+  std::uint64_t barge_ins = 0;
   {
     const std::scoped_lock lock(g_state->registry_mutex);
     calls = g_state->registry.size();
@@ -493,6 +600,8 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
         sent += stats.sent_bytes;
         reconnects += stats.reconnects;
         buffered += stats.buffered_bytes;
+        playback_played += stats.playback_bytes_played;
+        barge_ins += stats.barge_ins;
       }
     }
   }
@@ -501,12 +610,14 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
       stream,
       "{\"calls\":%lu,\"forks\":%lu,\"shards\":%lu,\"sent_bytes\":%llu,"
       "\"media_dropped_bytes\":%llu,\"buffer_dropped_bytes\":%llu,\"reconnects\":%llu,"
-      "\"buffered_bytes\":%lu,\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
+      "\"buffered_bytes\":%lu,\"playback_bytes_played\":%llu,\"barge_ins\":%llu,"
+      "\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
       static_cast<unsigned long>(calls), static_cast<unsigned long>(forks),
       static_cast<unsigned long>(g_state->shards->shard_count()),
       static_cast<unsigned long long>(sent), static_cast<unsigned long long>(media_dropped),
       static_cast<unsigned long long>(buffer_dropped), static_cast<unsigned long long>(reconnects),
-      static_cast<unsigned long>(buffered), static_cast<unsigned long>(pool.allocated_bytes),
+      static_cast<unsigned long>(buffered), static_cast<unsigned long long>(playback_played),
+      static_cast<unsigned long long>(barge_ins), static_cast<unsigned long>(pool.allocated_bytes),
       static_cast<unsigned long>(pool.leased_slabs));
   return SWITCH_STATUS_SUCCESS;
 }

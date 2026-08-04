@@ -62,6 +62,7 @@ class WsConnection {
 
   [[nodiscard]] bool SendText(std::string_view text);
   [[nodiscard]] bool SendBinary(ConstByteSpan bytes);
+  void SetReceivePaused(bool paused);
   void Close();
 
  private:

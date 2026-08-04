@@ -35,6 +35,7 @@ class FakeConnection : public NetConnection {
  public:
   bool accept_sends = true;
   bool closed = false;
+  bool receive_paused = false;
   std::vector<std::string> texts;
   std::vector<std::uint8_t> binary;
 
@@ -52,6 +53,7 @@ class FakeConnection : public NetConnection {
     binary.insert(binary.end(), bytes.begin(), bytes.end());
     return true;
   }
+  void SetReceivePaused(bool paused) override { receive_paused = paused; }
   void Close() override { closed = true; }
 };
 

@@ -9,9 +9,11 @@ FetchContent_MakeAvailable(nlohmann_json)
 add_library(audiofork_core STATIC
   src/config.cpp
   src/fork_session.cpp
+  src/jitter_buffer.cpp
   src/protocol.cpp
   src/send_buffer.cpp
   src/slab_pool.cpp
+  src/slab_queue.cpp
 )
 target_include_directories(audiofork_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(audiofork_core SYSTEM PRIVATE

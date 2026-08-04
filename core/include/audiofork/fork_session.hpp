@@ -12,6 +12,7 @@
 #include "audiofork/backoff.hpp"
 #include "audiofork/bytes.hpp"
 #include "audiofork/config.hpp"
+#include "audiofork/jitter_buffer.hpp"
 #include "audiofork/ports.hpp"
 #include "audiofork/send_buffer.hpp"
 #include "audiofork/session_state.hpp"
@@ -42,6 +43,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::chrono::milliseconds drain_timeout{2000};
     ReconnectBackoff::Options backoff;
     std::uint64_t backoff_seed = 0;
+    // zero disables playback: the fork is then send-only
+    std::size_t playback_high_watermark_bytes = 0;
+    std::size_t playback_low_watermark_bytes = 0;
+    std::size_t playback_handoff_bytes = 0;
   };
 
   struct Stats {
@@ -51,6 +56,11 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::uint64_t reconnects = 0;
     std::uint64_t unsupported_inbound = 0;
     std::size_t buffered_bytes = 0;
+    std::uint64_t playback_bytes_received = 0;
+    std::uint64_t playback_bytes_played = 0;
+    std::uint64_t playback_underruns = 0;
+    std::uint64_t barge_ins = 0;
+    std::size_t playback_buffered_bytes = 0;
   };
 
   [[nodiscard]] static std::shared_ptr<ForkSession> Create(ForkParams params, Tuning tuning,
@@ -66,6 +76,13 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void set_on_finished(std::function<void()> callback) { on_finished_ = std::move(callback); }
 
   [[nodiscard]] bool PushAudio(ConstByteSpan pcm) noexcept;
+
+  // MEDIA THREAD, lock-free: fills dest with playback audio and returns how many
+  // bytes were written. A short (or zero) return means the caller must leave the
+  // rest of the frame as it was — never inject silence over live call audio.
+  [[nodiscard]] std::size_t ReadPlayback(MutableByteSpan dest) noexcept;
+  [[nodiscard]] bool playback_enabled() const { return playback_.has_value(); }
+  [[nodiscard]] AudioFormat playback_format() const noexcept;
 
   void OnConnected() override;
   void OnText(std::string_view text) override;
@@ -85,6 +102,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void ScheduleRetry();
   void DrainHandoffRing();
   void FlushToConnection();
+  void PumpPlayback();
+  void HandlePlaybackStart(std::uint32_t sample_rate, std::uint8_t channels);
+  void HandleClear();
+  void HandleMark(std::string name);
   void Emit(ForkEventType type, std::string detail = {});
   void EmitOverrunIfNewEpisode(std::size_t dropped);
   [[nodiscard]] std::uint64_t BytesToMs(std::uint64_t bytes) const;
@@ -98,6 +119,17 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   SessionStateMachine state_;
   std::unique_ptr<SpscByteRing> ring_;
   SendBuffer buffer_;
+  // playback state: the buffer is shard-owned, the ring hands frames to the
+  // media thread, and the generation lets a barge-in discard what is already in
+  // flight without either side taking a lock
+  std::optional<JitterBuffer> playback_;
+  std::unique_ptr<SpscByteRing> playback_ring_;
+  std::atomic<std::uint64_t> playback_generation_{0};
+  std::atomic<std::uint64_t> media_playback_generation_{0};
+  std::atomic<std::uint32_t> playback_rate_{0};
+  std::atomic<std::uint8_t> playback_channels_{0};
+  bool playback_started_ = false;
+  bool receive_paused_ = false;
   ReconnectBackoff backoff_;
   NetConnection* connection_ = nullptr;
   std::function<void()> on_finished_;
@@ -118,6 +150,11 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   std::atomic<std::uint64_t> reconnects_{0};
   std::atomic<std::uint64_t> unsupported_inbound_{0};
   std::atomic<std::size_t> buffered_bytes_{0};
+  std::atomic<std::uint64_t> playback_bytes_received_{0};
+  std::atomic<std::uint64_t> playback_bytes_played_{0};
+  std::atomic<std::uint64_t> playback_underruns_{0};
+  std::atomic<std::uint64_t> barge_ins_{0};
+  std::atomic<std::size_t> playback_buffered_bytes_{0};
 };
 
 }  // namespace audiofork

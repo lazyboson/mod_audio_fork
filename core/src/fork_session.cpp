@@ -1,6 +1,7 @@
 #include "audiofork/fork_session.hpp"
 
 #include <algorithm>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -24,6 +25,9 @@ std::shared_ptr<ForkSession> ForkSession::Create(ForkParams params, Tuning tunin
   if (session->ring_ == nullptr) {
     return nullptr;
   }
+  if (session->playback_.has_value() && session->playback_ring_ == nullptr) {
+    return nullptr;
+  }
   return session;
 }
 
@@ -35,8 +39,16 @@ ForkSession::ForkSession(PrivateTag, ForkParams params, Tuning tuning, NetPort& 
       events_(events),
       clock_(clock),
       ring_(SpscByteRing::Create(tuning.handoff_bytes)),
-      buffer_(std::move(pool), tuning.send_cap_bytes),
-      backoff_(tuning.backoff, tuning.backoff_seed) {}
+      buffer_(pool, tuning.send_cap_bytes),
+      backoff_(tuning.backoff, tuning.backoff_seed) {
+  if (tuning.playback_high_watermark_bytes > 0 && tuning.playback_handoff_bytes > 0) {
+    playback_.emplace(std::move(pool),
+                      JitterBuffer::Options{tuning.playback_high_watermark_bytes * 2});
+    playback_ring_ = SpscByteRing::Create(tuning.playback_handoff_bytes);
+    playback_rate_.store(params_.format.sample_rate, std::memory_order_relaxed);
+    playback_channels_.store(1, std::memory_order_relaxed);
+  }
+}
 
 void ForkSession::Start() { BeginConnect(); }
 
@@ -58,6 +70,33 @@ bool ForkSession::PushAudio(ConstByteSpan pcm) noexcept {
   return true;
 }
 
+std::size_t ForkSession::ReadPlayback(MutableByteSpan dest) noexcept {
+  if (playback_ring_ == nullptr || dest.empty()) {
+    return 0;
+  }
+  // a barge-in bumped the generation: discard audio already handed over, or the
+  // caller would hear up to a ring's worth of interrupted speech
+  const std::uint64_t generation = playback_generation_.load(std::memory_order_acquire);
+  if (generation != media_playback_generation_.load(std::memory_order_relaxed)) {
+    media_playback_generation_.store(generation, std::memory_order_relaxed);
+    while (playback_ring_->Pop(dest) > 0) {
+    }
+    return 0;
+  }
+  const std::size_t filled = playback_ring_->Pop(dest);
+  if (filled == 0) {
+    playback_underruns_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    playback_bytes_played_.fetch_add(filled, std::memory_order_relaxed);
+  }
+  return filled;
+}
+
+AudioFormat ForkSession::playback_format() const noexcept {
+  return AudioFormat{playback_rate_.load(std::memory_order_relaxed),
+                     playback_channels_.load(std::memory_order_relaxed)};
+}
+
 void ForkSession::Stop() {
   // may be called from the media or a control thread: never touch the
   // connection here, only hop to the shard
@@ -67,6 +106,7 @@ void ForkSession::Stop() {
 
 void ForkSession::Pump() {
   DrainHandoffRing();
+  PumpPlayback();
   if (state_.state() == SessionState::kActive) {
     FlushToConnection();
     return;
@@ -113,9 +153,23 @@ void ForkSession::OnText(std::string_view text) {
     Emit(ForkEventType::kJsonError, invalid->reason);
     return;
   }
-  // playback control arrives only from a server expecting M4 behaviour
-  if (unsupported_inbound_.fetch_add(1, std::memory_order_relaxed) == 0) {
-    Emit(ForkEventType::kError, "playback control received but playback is not enabled");
+  if (!playback_.has_value()) {
+    if (unsupported_inbound_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      Emit(ForkEventType::kError, "playback control received but playback is not enabled");
+    }
+    return;
+  }
+  if (const auto* start = std::get_if<StartPlayback>(&message)) {
+    HandlePlaybackStart(start->sample_rate, start->channels);
+    return;
+  }
+  if (std::holds_alternative<ClearPlayback>(message)) {
+    HandleClear();
+    return;
+  }
+  if (const auto* mark = std::get_if<PlaybackMark>(&message)) {
+    HandleMark(mark->name);
+    return;
   }
 }
 
@@ -123,9 +177,22 @@ void ForkSession::OnBinary(ConstByteSpan bytes) {
   if (bytes.empty()) {
     return;
   }
-  if (unsupported_inbound_.fetch_add(1, std::memory_order_relaxed) == 0) {
-    Emit(ForkEventType::kError, "inbound audio received but playback is not enabled");
+  if (!playback_.has_value()) {
+    if (unsupported_inbound_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      Emit(ForkEventType::kError, "inbound audio received but playback is not enabled");
+    }
+    return;
   }
+  playback_bytes_received_.fetch_add(bytes.size(), std::memory_order_relaxed);
+  const std::size_t refused = playback_->Append(bytes);
+  if (refused > 0 && !playback_->muted()) {
+    Emit(ForkEventType::kError, "playback buffer overflowed, audio discarded");
+  }
+  if (!playback_started_ && !playback_->empty()) {
+    playback_started_ = true;
+    Emit(ForkEventType::kPlaybackStart);
+  }
+  PumpPlayback();
 }
 
 void ForkSession::OnClosed(bool connect_failed) {
@@ -236,6 +303,12 @@ void ForkSession::Finalize() {
   // free slabs now rather than at destruction: a pending retry timer may hold
   // the last reference for seconds after the call is gone
   buffer_.Clear();
+  if (playback_.has_value()) {
+    playback_->Clear();
+    if (playback_started_) {
+      Emit(ForkEventType::kPlaybackStop);
+    }
+  }
   connection_ = nullptr;
   Emit(ForkEventType::kStop);
   if (on_finished_) {
@@ -312,6 +385,70 @@ void ForkSession::EmitOverrunIfNewEpisode(std::size_t dropped) {
   events_.Emit(event);
 }
 
+void ForkSession::PumpPlayback() {
+  if (!playback_.has_value()) {
+    return;
+  }
+  // hand as much as the ring will take; the media thread paces actual playback
+  while (!playback_->empty()) {
+    const ConstByteSpan chunk = playback_->Peek(tuning_.playback_handoff_bytes);
+    if (chunk.empty() || !playback_ring_->Push(chunk)) {
+      break;
+    }
+    playback_->Consume(chunk.size());
+  }
+  for (auto& name : playback_->TakeReachedMarks()) {
+    Emit(ForkEventType::kMark, name);
+  }
+  playback_buffered_bytes_.store(playback_->size(), std::memory_order_relaxed);
+
+  if (connection_ == nullptr) {
+    return;
+  }
+  // Watermarks count everything unplayed, buffer AND handoff ring: the ring can
+  // hold a sizeable slice, and ignoring it would let total buffering overshoot
+  // the configured ceiling without ever pausing. While paused the peer's audio
+  // waits in TCP buffers instead of ours, so nothing is lost.
+  const std::size_t in_flight = playback_->size() + playback_ring_->size();
+  if (!receive_paused_ && in_flight >= tuning_.playback_high_watermark_bytes) {
+    receive_paused_ = true;
+    connection_->SetReceivePaused(true);
+  } else if (receive_paused_ && in_flight <= tuning_.playback_low_watermark_bytes) {
+    receive_paused_ = false;
+    connection_->SetReceivePaused(false);
+  }
+}
+
+void ForkSession::HandlePlaybackStart(std::uint32_t sample_rate, std::uint8_t channels) {
+  if (sample_rate != 0) {
+    playback_rate_.store(sample_rate, std::memory_order_relaxed);
+  }
+  if (channels != 0) {
+    playback_channels_.store(channels, std::memory_order_relaxed);
+  }
+  const AudioFormat format = playback_format();
+  Emit(ForkEventType::kPlaybackStart, std::to_string(format.sample_rate) + "/" +
+                                          std::to_string(static_cast<int>(format.channels)));
+  playback_started_ = true;
+}
+
+void ForkSession::HandleClear() {
+  playback_->Clear();
+  // the media thread may already hold frames: bumping the generation makes it
+  // discard them on its next read, which is what keeps barge-in inside one frame
+  playback_generation_.fetch_add(1, std::memory_order_release);
+  playback_buffered_bytes_.store(0, std::memory_order_relaxed);
+  barge_ins_.fetch_add(1, std::memory_order_relaxed);
+  playback_started_ = false;
+  if (receive_paused_ && connection_ != nullptr) {
+    receive_paused_ = false;
+    connection_->SetReceivePaused(false);
+  }
+  Emit(ForkEventType::kPlaybackCleared);
+}
+
+void ForkSession::HandleMark(std::string name) { playback_->AddMark(std::move(name)); }
+
 std::uint64_t ForkSession::BytesToMs(std::uint64_t bytes) const {
   const std::size_t per_second = params_.format.BytesPerSecond();
   if (per_second == 0) {
@@ -326,7 +463,12 @@ ForkSession::Stats ForkSession::stats() const {
                sent_bytes_.load(std::memory_order_relaxed),
                reconnects_.load(std::memory_order_relaxed),
                unsupported_inbound_.load(std::memory_order_relaxed),
-               buffered_bytes_.load(std::memory_order_relaxed)};
+               buffered_bytes_.load(std::memory_order_relaxed),
+               playback_bytes_received_.load(std::memory_order_relaxed),
+               playback_bytes_played_.load(std::memory_order_relaxed),
+               playback_underruns_.load(std::memory_order_relaxed),
+               barge_ins_.load(std::memory_order_relaxed),
+               playback_buffered_bytes_.load(std::memory_order_relaxed)};
 }
 
 }  // namespace audiofork

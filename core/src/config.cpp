@@ -19,6 +19,10 @@ ModuleConfig SanitizeConfig(ModuleConfig config) {
   config.coalesce_max = std::clamp(config.coalesce_max, kMinCoalesce, config.handoff_buffer);
   config.emergency_buffer = std::clamp(config.emergency_buffer, kMinCoalesce, config.send_buffer);
   config.drain_timeout = std::max(config.drain_timeout, std::chrono::milliseconds{0});
+  config.playback_high_watermark =
+      std::clamp(config.playback_high_watermark, kMinCoalesce, kMaxBuffer);
+  config.playback_low_watermark = std::clamp(
+      config.playback_low_watermark, std::chrono::milliseconds{0}, config.playback_high_watermark);
   config.reconnect_min = std::max(config.reconnect_min, std::chrono::milliseconds{1});
   config.reconnect_max = std::max(config.reconnect_max, config.reconnect_min);
   config.slab_size_bytes = std::max(config.slab_size_bytes, std::size_t{4} * 1024);

@@ -3,7 +3,9 @@
 #include <libwebsockets.h>
 
 #include <array>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "audiofork_net/ws_client.hpp"
 
@@ -69,6 +71,17 @@ TestWsServer::~TestWsServer() {
   if (context_ != nullptr) {
     lws_context_destroy(context_);
   }
+}
+
+void TestWsServer::Broadcast(std::string payload, bool binary) {
+  Post([this, payload = std::move(payload), binary] {
+    for (auto& [wsi, state] : connections_) {
+      std::vector<std::uint8_t> framed(LWS_PRE);
+      framed.insert(framed.end(), payload.begin(), payload.end());
+      state.outgoing.emplace_back(std::move(framed), binary);
+      lws_callback_on_writable(wsi);
+    }
+  });
 }
 
 void TestWsServer::CloseAllConnections() {

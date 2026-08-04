@@ -39,7 +39,7 @@ class ThreadSafeEvents : public EventSink {
   std::vector<ForkEventType> types_;
 };
 
-ForkSession::Tuning MakeTuning() {
+ForkSession::Tuning MakeTuning(bool playback = false) {
   const AudioFormat format{16000, 2};
   ForkSession::Tuning tuning;
   tuning.send_cap_bytes = format.BytesForDuration(1000ms);
@@ -47,6 +47,12 @@ ForkSession::Tuning MakeTuning() {
   tuning.coalesce_max_bytes = format.BytesForDuration(100ms);
   tuning.drain_timeout = 500ms;
   tuning.backoff = {20ms, 100ms, 2.0, 0.0};
+  if (playback) {
+    const AudioFormat mono{16000, 1};
+    tuning.playback_high_watermark_bytes = mono.BytesForDuration(1000ms);
+    tuning.playback_low_watermark_bytes = mono.BytesForDuration(200ms);
+    tuning.playback_handoff_bytes = mono.BytesForDuration(200ms);
+  }
   return tuning;
 }
 
@@ -196,6 +202,67 @@ TEST(ShardPool, ManyForksSpreadAcrossShardsAndAllRetire) {
   }
   ASSERT_TRUE(WaitUntil([&] { return fx.pool->active_forks() == 0U; }));
   EXPECT_EQ(fx.slabs->stats().leased_slabs, 0U);
+}
+
+TEST(ShardPool, PlaybackAudioArrivesFromTheServerByteExact) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  PoolFixture fx(1);
+
+  auto session = fx.pool->StartFork(MakeParams(server->port(), "fork-pb"), MakeTuning(true),
+                                    fx.events, fx.clock);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kConnect) == 1U; }));
+
+  // the echo server returns whatever we send, so forked audio comes back as
+  // playback audio: a full round trip through two real sockets
+  std::vector<std::uint8_t> pcm(1280);
+  std::iota(pcm.begin(), pcm.end(), 11);
+  EXPECT_TRUE(session->PushAudio(ConstByteSpan(pcm)));
+
+  ASSERT_TRUE(WaitUntil([&] { return session->stats().playback_bytes_received >= pcm.size(); }));
+
+  std::vector<std::uint8_t> played;
+  ASSERT_TRUE(WaitUntil([&] {
+    std::vector<std::uint8_t> frame(320);
+    const std::size_t filled = session->ReadPlayback(MutableByteSpan(frame));
+    played.insert(played.end(), frame.begin(), frame.begin() + static_cast<std::ptrdiff_t>(filled));
+    return played.size() >= pcm.size();
+  }));
+  EXPECT_EQ(played, pcm);
+
+  session->Stop();
+  ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kDead; }));
+  EXPECT_EQ(fx.slabs->stats().leased_slabs, 0U);
+}
+
+TEST(ShardPool, BargeInOverRealSocketsSilencesPlaybackImmediately) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  PoolFixture fx(1);
+
+  auto session = fx.pool->StartFork(MakeParams(server->port(), "fork-barge"), MakeTuning(true),
+                                    fx.events, fx.clock);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kConnect) == 1U; }));
+
+  std::vector<std::uint8_t> pcm(4096);
+  std::iota(pcm.begin(), pcm.end(), 3);
+  EXPECT_TRUE(session->PushAudio(ConstByteSpan(pcm)));
+  ASSERT_TRUE(WaitUntil([&] { return session->stats().playback_bytes_received >= pcm.size(); }));
+
+  server->Broadcast(R"({"type":"clear"})", /*binary=*/false);
+  ASSERT_TRUE(WaitUntil([&] { return session->stats().barge_ins == 1U; }));
+
+  // after the clear the very next frames must be silent
+  for (int i = 0; i < 3; ++i) {
+    std::vector<std::uint8_t> frame(320);
+    EXPECT_EQ(session->ReadPlayback(MutableByteSpan(frame)), 0U);
+  }
+  EXPECT_EQ(fx.events.Count(ForkEventType::kPlaybackCleared), 1U);
+
+  session->Stop();
+  ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kDead; }));
 }
 
 TEST(ShardPool, StopIsSafeFromAnotherThreadWhileAudioIsFlowing) {

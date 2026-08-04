@@ -6,7 +6,17 @@ received back into the call (bidirectional). Functional successor to drachtio's
 session-lifetime races, unbounded buffering, leaky error paths, and shared-thread
 stalls.
 
-**Status:** design locked 2026-08-04 (20 decisions below). M1 and M2 complete; M3 partially complete (see README Status).
+**Status:** design locked 2026-08-04 (20 decisions below). M1–M2 complete; M3–M4
+implemented but not verified on a live call (see README Status).
+
+Two clarifications the implementation forced:
+- Playback flow control counts the jitter buffer **and** the media-thread handoff
+  ring. Watching only the buffer let total buffering overshoot the configured
+  ceiling without ever pausing the socket.
+- A `mark` event fires when its audio is handed to the media thread, not when the
+  last sample leaves the speaker: carrying per-byte metadata through a lock-free
+  ring would cost more than the accuracy is worth. The error is bounded by the
+  handoff ring, i.e. `coalesce-max-ms`.
 
 ---
 

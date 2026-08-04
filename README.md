@@ -44,7 +44,13 @@ audio_fork status          # JSON counters: forks, bytes, drops, reconnects, poo
 ```
 
 Events are fired as custom events with subclass `mod_audio_fork::<name>`
-(`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`, …).
+(`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`,
+`playback_start`, `playback_cleared`, `mark`, …).
+
+The server drives playback over the same socket: binary frames are PCM to put in
+the caller's ear, `{"type":"clear"}` is barge-in (flushes buffered audio and
+mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback",
+"rate":…}` declares a rate other than the fork's.
 
 ## Status
 
@@ -64,5 +70,9 @@ Events are fired as custom events with subclass `mod_audio_fork::<name>`
   **Not yet verified:** audio flowing through a live call, and the 50-call
   smoke run (`rig/`). Those close out with the load rig in M5. Do not deploy
   this yet — see the banner above.
-- M4 (playback) — not started: server→caller audio, jitter buffer, barge-in.
+- M4 (playback) — **implemented, same verification gap as M3.** Jitter buffer,
+  WRITE_REPLACE injection with rate conversion, watermark flow control, and
+  `clear`/`mark` barge-in. 127 tests green under both sanitizers, including
+  byte-exact playback and barge-in over real sockets. Playback has never been
+  heard on a live call — that needs the rig.
 - M5 (chaos + soak) — not started: rig completion, nightly load tier, 48h gate.

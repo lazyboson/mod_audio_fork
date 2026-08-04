@@ -86,6 +86,14 @@ bool WsConnection::SendText(std::string_view text) {
 
 bool WsConnection::SendBinary(ConstByteSpan bytes) { return Enqueue(bytes, /*binary=*/true); }
 
+void WsConnection::SetReceivePaused(bool paused) {
+  if (wsi_ == nullptr || closed_delivered_) {
+    return;
+  }
+  // lws stops draining the socket, so the peer's audio waits in TCP buffers
+  (void)lws_rx_flow_control(wsi_, paused ? 0 : 1);
+}
+
 void WsConnection::Close() {
   if (closed_delivered_ || close_requested_) {
     return;

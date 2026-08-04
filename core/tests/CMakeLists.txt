@@ -9,6 +9,8 @@ add_executable(audiofork_core_tests
   backoff_test.cpp
   config_test.cpp
   fork_session_test.cpp
+  jitter_buffer_test.cpp
+  playback_test.cpp
   protocol_test.cpp
   send_buffer_test.cpp
   session_interleave_test.cpp

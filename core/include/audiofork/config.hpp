@@ -39,6 +39,8 @@ struct ModuleConfig {
   std::chrono::milliseconds handoff_buffer{1000};
   std::chrono::milliseconds coalesce_max{100};
   std::chrono::milliseconds drain_timeout{2000};
+  std::chrono::milliseconds playback_high_watermark{10000};
+  std::chrono::milliseconds playback_low_watermark{2000};
   std::size_t global_memory_cap_bytes = std::size_t{1536} * 1024 * 1024;
   std::chrono::milliseconds emergency_buffer{2000};
   std::chrono::milliseconds reconnect_min{250};

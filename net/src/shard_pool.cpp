@@ -20,6 +20,11 @@ class WsConnectionAdapter : public NetConnection, public WsConnectionHandler {
   [[nodiscard]] bool SendBinary(ConstByteSpan bytes) override {
     return connection_ != nullptr && connection_->SendBinary(bytes);
   }
+  void SetReceivePaused(bool paused) override {
+    if (connection_ != nullptr) {
+      connection_->SetReceivePaused(paused);
+    }
+  }
   void Close() override {
     if (connection_ != nullptr) {
       connection_->Close();

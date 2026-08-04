@@ -24,6 +24,9 @@ class NetConnection {
 
   [[nodiscard]] virtual bool SendText(std::string_view text) = 0;
   [[nodiscard]] virtual bool SendBinary(ConstByteSpan bytes) = 0;
+  // Watermark flow control: while paused the peer's audio stays in TCP buffers
+  // instead of ours, so nothing is dropped (DESIGN.md §7).
+  virtual void SetReceivePaused(bool paused) = 0;
   virtual void Close() = 0;
 };
 
@@ -65,6 +68,10 @@ enum class ForkEventType : std::uint8_t {
   kDisconnect,
   kError,
   kStop,
+  kPlaybackStart,
+  kPlaybackStop,
+  kPlaybackCleared,
+  kMark,
 };
 
 struct ForkEvent {

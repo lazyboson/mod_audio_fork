@@ -32,6 +32,8 @@ class TestWsServer {
   TestWsServer& operator=(TestWsServer&&) = delete;
 
   [[nodiscard]] std::uint16_t port() const { return port_; }
+  // Queue a text or binary frame to every live connection (playback tests).
+  void Broadcast(std::string payload, bool binary);
   [[nodiscard]] int total_connections() const { return total_connections_.load(); }
   void CloseAllConnections();
 
