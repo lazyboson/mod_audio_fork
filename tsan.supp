@@ -12,3 +12,13 @@ race:lws_cancel_service
 # lifecycle tags, which ARE load-bearing and are fixed properly by building lws
 # with LWS_MAX_SMP > 1 (see net/CMakeLists.txt).
 race:_realloc
+
+# lws takes its context-refcount mutex and its per-thread mutex in opposite
+# orders on the context-create path (lws_create_context -> lws_wsi_inject_to_loop)
+# and the wsi-close path, so TSan reports a lock cycle whenever one context is
+# created while another context's service thread runs. Production closes that
+# window by construction: ShardPool creates every context before starting any
+# thread and joins every thread before destroying any context. The test harness
+# deliberately interleaves independent client and server contexts, which is what
+# trips this. Revisit if lws fixes its lock ordering upstream.
+deadlock:lws_mutex_refcount_lock

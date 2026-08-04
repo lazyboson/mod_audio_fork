@@ -64,25 +64,31 @@ void LwsNetPort::ScheduleTimer(std::chrono::milliseconds delay, std::function<vo
   loop_.ScheduleTimer(delay, std::move(task));
 }
 
-std::unique_ptr<Shard> Shard::Start(std::chrono::milliseconds tick) {
+std::unique_ptr<Shard> Shard::Create(std::chrono::milliseconds tick) {
   auto shard = std::make_unique<Shard>();
   shard->loop_ = WsEventLoop::Create();
   if (shard->loop_ == nullptr) {
     return nullptr;
   }
+  shard->tick_ = tick;
   shard->port_ = std::make_unique<LwsNetPort>(*shard->loop_);
-  Shard* raw = shard.get();
-  shard->loop_->SetTick(tick, [raw] { raw->Tick(); });
-  shard->thread_ = std::thread([raw] { raw->loop_->Run(); });
   return shard;
 }
 
-Shard::~Shard() {
+void Shard::StartThread() {
+  Shard* raw = this;
+  loop_->SetTick(tick_, [raw] { raw->Tick(); });
+  thread_ = std::thread([raw] { raw->loop_->Run(); });
+}
+
+void Shard::StopThread() {
   if (thread_.joinable()) {
     loop_->Stop();
     thread_.join();
   }
 }
+
+Shard::~Shard() { StopThread(); }
 
 void Shard::Adopt(std::shared_ptr<ForkSession> session) {
   // hop onto the loop thread: sessions_ is loop-owned state
@@ -115,13 +121,25 @@ std::unique_ptr<ShardPool> ShardPool::Start(const ModuleConfig& config, SlabPool
     count = hardware == 0 ? 2 : std::min<std::size_t>(hardware, 16);
   }
   for (std::size_t i = 0; i < count; ++i) {
-    auto shard = Shard::Start(kTickInterval);
+    auto shard = Shard::Create(kTickInterval);
     if (shard == nullptr) {
       return nullptr;
     }
     shard_pool->shards_.push_back(std::move(shard));
   }
+  // every context exists before any service thread starts
+  for (auto& shard : shard_pool->shards_) {
+    shard->StartThread();
+  }
   return shard_pool;
+}
+
+ShardPool::~ShardPool() {
+  // every thread stops before any context is destroyed
+  for (auto& shard : shards_) {
+    shard->StopThread();
+  }
+  shards_.clear();
 }
 
 std::shared_ptr<ForkSession> ShardPool::StartFork(ForkParams params,

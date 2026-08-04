@@ -35,9 +35,18 @@ class LwsNetPort : public NetPort {
 
 // One shard: a thread, an lws context, and the sessions pinned to it. Sessions
 // are pumped from the loop's tick, so the media thread never has to wake it.
+//
+// Lifecycle is deliberately two-phase (Create/StartThread, StopThread/destroy).
+// lws acquires its context-refcount and per-thread mutexes in opposite orders on
+// the context-create and wsi-close paths, so creating a context while any other
+// lws service thread runs is a genuine deadlock window. Creating every context
+// before starting any thread, and joining every thread before destroying any
+// context, closes it by construction.
 class Shard {
  public:
-  [[nodiscard]] static std::unique_ptr<Shard> Start(std::chrono::milliseconds tick);
+  [[nodiscard]] static std::unique_ptr<Shard> Create(std::chrono::milliseconds tick);
+  void StartThread();
+  void StopThread();
   ~Shard();
   Shard(const Shard&) = delete;
   Shard& operator=(const Shard&) = delete;
@@ -53,6 +62,7 @@ class Shard {
  private:
   void Tick();
 
+  std::chrono::milliseconds tick_{0};
   std::unique_ptr<WsEventLoop> loop_;
   std::unique_ptr<LwsNetPort> port_;
   std::vector<std::shared_ptr<ForkSession>> sessions_;
@@ -65,6 +75,11 @@ class Shard {
 class ShardPool {
  public:
   [[nodiscard]] static std::unique_ptr<ShardPool> Start(const ModuleConfig& config, SlabPool pool);
+  ~ShardPool();
+  ShardPool(const ShardPool&) = delete;
+  ShardPool& operator=(const ShardPool&) = delete;
+  ShardPool(ShardPool&&) = delete;
+  ShardPool& operator=(ShardPool&&) = delete;
 
   [[nodiscard]] std::shared_ptr<ForkSession> StartFork(ForkParams params,
                                                        const ForkSession::Tuning& tuning,
