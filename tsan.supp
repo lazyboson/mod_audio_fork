@@ -3,3 +3,12 @@
 # real synchronization TSan's memory model cannot see. Everything else in lws
 # runs single-threaded on its owning shard.
 race:lws_cancel_service
+
+# lws's _realloc keeps a global `allocated` byte counter via
+# malloc_usable_size (lib/core/alloc.c) with no synchronisation. It exists only
+# where glibc provides malloc_usable_size, which is why this is Linux-only. It
+# is read by nothing — pure allocation statistics — so concurrent shard threads
+# racing on it cannot affect behaviour. Contrast the log-context refcount and
+# lifecycle tags, which ARE load-bearing and are fixed properly by building lws
+# with LWS_MAX_SMP > 1 (see net/CMakeLists.txt).
+race:_realloc

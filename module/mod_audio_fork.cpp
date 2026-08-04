@@ -336,8 +336,8 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
     return SWITCH_STATUS_FALSE;
   }
   fork->set_on_finished([uuid, weak = std::weak_ptr<ForkSession>(fork)] {
-    if (auto session = weak.lock()) {
-      ForgetFork(uuid, session);
+    if (auto finished = weak.lock()) {
+      ForgetFork(uuid, finished);
     }
   });
 
