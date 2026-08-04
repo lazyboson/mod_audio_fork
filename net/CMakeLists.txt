@@ -9,6 +9,9 @@ set(LWS_WITHOUT_TEST_SERVER ON CACHE BOOL "" FORCE)
 set(LWS_WITHOUT_TEST_PING ON CACHE BOOL "" FORCE)
 set(LWS_WITHOUT_TEST_CLIENT ON CACHE BOOL "" FORCE)
 set(LWS_WITH_MINIMAL_EXAMPLES OFF CACHE BOOL "" FORCE)
+# Linux-only kernel route monitoring; unused by us, and its POLLIN handler
+# races on lws globals when several contexts run on their own threads
+set(LWS_WITH_NETLINK OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(libwebsockets
   URL https://github.com/warmcat/libwebsockets/archive/refs/tags/v4.3.3.tar.gz

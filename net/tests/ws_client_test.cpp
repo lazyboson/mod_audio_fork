@@ -242,6 +242,12 @@ TEST(WsClient, ReconnectWithBackoffEventuallySucceeds) {
   ASSERT_EQ(delays.size(), 2U);
   EXPECT_EQ(delays[0], 10ms);
   EXPECT_EQ(delays[1], 20ms);
+
+  // client-side OnConnected can precede the server thread's ESTABLISHED count
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (server->total_connections() != 1 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
   EXPECT_EQ(server->total_connections(), 1);
 }
 
