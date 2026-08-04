@@ -99,8 +99,10 @@ TEST(ShardPool, ForkStreamsAudioThroughRealSocketsAndTearsDownCleanly) {
   auto session =
       fx.pool->StartFork(MakeParams(server->port(), "fork-a"), MakeTuning(), fx.events, fx.clock);
   ASSERT_NE(session, nullptr);
-  ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kActive; }));
-  EXPECT_EQ(fx.events.Count(ForkEventType::kConnect), 1U);
+  // wait on the event, not the state: the state machine reaches kActive just
+  // before the connect event is emitted
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kConnect) == 1U; }));
+  EXPECT_EQ(session->state(), SessionState::kActive);
 
   std::vector<std::uint8_t> pcm(1280);
   std::iota(pcm.begin(), pcm.end(), 0);
