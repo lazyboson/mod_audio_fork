@@ -18,6 +18,19 @@ jobs:
       - run: cmake --build --preset ${{ matrix.preset }} --parallel
       - run: ctest --preset ${{ matrix.preset }}
 
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: CC=clang CXX=clang++ cmake --preset fuzz
+      - run: cmake --build --preset fuzz --parallel --target protocol_fuzz
+      - run: |
+          mkdir -p /tmp/fuzz-scratch
+          ./build/fuzz/core/tests/protocol_fuzz -runs=200000 -max_len=4096 -timeout=10 \
+            /tmp/fuzz-scratch core/tests/fuzz/corpus
+
   format:
     runs-on: ubuntu-latest
     steps:

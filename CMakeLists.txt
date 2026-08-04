@@ -9,5 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(audiofork_warnings INTERFACE)
 target_compile_options(audiofork_warnings INTERFACE -Wall -Wextra -Werror -Wshadow)
 
+option(AUDIOFORK_FUZZ "Build libFuzzer targets (requires clang)" OFF)
+option(AUDIOFORK_BUILD_NET "Build the libwebsockets shim" ON)
+
 include(CTest)
 add_subdirectory(core)
+if(AUDIOFORK_BUILD_NET)
+  add_subdirectory(net)
+endif()

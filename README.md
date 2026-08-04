@@ -20,5 +20,8 @@ dependency and builds anywhere; the FreeSWITCH module shell arrives in M3.
 
 ## Status
 
-M1 (core foundation) — session state machine, SPSC ring, slab pool, with unit,
-exhaustive-interleaving, and sanitizer test suites.
+- M1 (core foundation) ✅ — session state machine, SPSC ring, slab pool, with
+  unit, exhaustive-interleaving, and sanitizer test suites.
+- M2 (network shim + protocol) — libwebsockets RAII event loop (`net/`),
+  wire-protocol codec with libFuzzer harness, jittered reconnect backoff,
+  echo/reconnect integration tests against an in-process mock WS server.

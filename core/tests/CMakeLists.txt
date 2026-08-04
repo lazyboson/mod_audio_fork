@@ -6,14 +6,26 @@ FetchContent_Declare(googletest
 FetchContent_MakeAvailable(googletest)
 
 add_executable(audiofork_core_tests
-  spsc_ring_test.cpp
-  slab_pool_test.cpp
-  session_state_test.cpp
+  backoff_test.cpp
+  protocol_test.cpp
   session_interleave_test.cpp
+  session_state_test.cpp
+  slab_pool_test.cpp
+  spsc_ring_test.cpp
 )
 target_link_libraries(audiofork_core_tests
   PRIVATE audiofork_core audiofork_warnings GTest::gtest_main
 )
+target_include_directories(audiofork_core_tests SYSTEM PRIVATE
+  $<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 include(GoogleTest)
 gtest_discover_tests(audiofork_core_tests)
+
+if(AUDIOFORK_FUZZ)
+  add_executable(protocol_fuzz fuzz/protocol_fuzz.cpp)
+  target_link_libraries(protocol_fuzz PRIVATE audiofork_core audiofork_warnings)
+  target_compile_options(protocol_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_options(protocol_fuzz PRIVATE -fsanitize=fuzzer)
+endif()

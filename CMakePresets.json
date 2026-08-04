@@ -18,6 +18,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all",
+        "CMAKE_C_FLAGS": "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
       }
     },
@@ -26,6 +27,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_CXX_FLAGS": "-O1 -g -fsanitize=thread",
+        "CMAKE_C_FLAGS": "-O1 -g -fsanitize=thread",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread"
       }
     },
@@ -33,17 +35,33 @@
       "name": "release",
       "inherits": "base",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "cacheVariables": {
+        "AUDIOFORK_FUZZ": "ON",
+        "AUDIOFORK_BUILD_NET": "OFF",
+        "CMAKE_CXX_FLAGS": "-O1 -g -fsanitize=fuzzer-no-link,address,undefined",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
     }
   ],
   "buildPresets": [
     {"name": "debug", "configurePreset": "debug"},
     {"name": "asan", "configurePreset": "asan"},
     {"name": "tsan", "configurePreset": "tsan"},
-    {"name": "release", "configurePreset": "release"}
+    {"name": "release", "configurePreset": "release"},
+    {"name": "fuzz", "configurePreset": "fuzz"}
   ],
   "testPresets": [
     {"name": "asan", "configurePreset": "asan", "output": {"outputOnFailure": true}},
-    {"name": "tsan", "configurePreset": "tsan", "output": {"outputOnFailure": true}},
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {"outputOnFailure": true},
+      "environment": {"TSAN_OPTIONS": "suppressions=${sourceDir}/tsan.supp"}
+    },
     {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}}
   ]
 }

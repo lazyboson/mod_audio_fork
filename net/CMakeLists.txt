@@ -1,0 +1,33 @@
+include(FetchContent)
+
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(LWS_WITH_SSL OFF CACHE BOOL "" FORCE)
+set(LWS_WITH_SHARED OFF CACHE BOOL "" FORCE)
+set(LWS_WITH_STATIC ON CACHE BOOL "" FORCE)
+set(LWS_WITHOUT_TESTAPPS ON CACHE BOOL "" FORCE)
+set(LWS_WITHOUT_TEST_SERVER ON CACHE BOOL "" FORCE)
+set(LWS_WITHOUT_TEST_PING ON CACHE BOOL "" FORCE)
+set(LWS_WITHOUT_TEST_CLIENT ON CACHE BOOL "" FORCE)
+set(LWS_WITH_MINIMAL_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(libwebsockets
+  URL https://github.com/warmcat/libwebsockets/archive/refs/tags/v4.3.3.tar.gz
+  URL_HASH SHA256=6fd33527b410a37ebc91bb64ca51bdabab12b076bc99d153d7c5dd405e4bdf90
+)
+FetchContent_MakeAvailable(libwebsockets)
+
+add_library(audiofork_net STATIC
+  src/ws_client.cpp
+)
+target_include_directories(audiofork_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(audiofork_net SYSTEM PRIVATE
+  $<TARGET_PROPERTY:websockets,INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(audiofork_net
+  PUBLIC audiofork_core
+  PRIVATE websockets audiofork_warnings
+)
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
