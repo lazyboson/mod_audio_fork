@@ -6,7 +6,7 @@ received back into the call (bidirectional). Functional successor to drachtio's
 session-lifetime races, unbounded buffering, leaky error paths, and shared-thread
 stalls.
 
-**Status:** design locked 2026-08-04 (18 decisions below). No code yet.
+**Status:** design locked 2026-08-04 (20 decisions below). M1 (core foundation) in progress.
 
 ---
 
@@ -36,7 +36,7 @@ stalls.
 | 5 | Process boundary | Everything in-process in the module |
 | 6 | Playback injection | Media bug WRITE_REPLACE + adaptive jitter buffer |
 | 7 | Session lifetime | Refcounted session + explicit atomic state machine |
-| 8 | Buffer memory | 64KB slabs from a global lock-free pool, per-fork caps |
+| 8 | Buffer memory | 64KB slabs from a global pool, per-fork caps |
 | 9 | Reconnect policy | Unbounded, backoff 250ms→5s, keep buffering through gap |
 | 10 | Overload protection | Global pool cap + graceful degradation (never OOM) |
 | 11 | Framing | Raw PCM binary frames; JSON text for all control |
@@ -113,9 +113,11 @@ CONNECTING → ACTIVE ↔ RECONNECTING
 
 ## 5. Memory design (Issues 8, 10)
 
-- **Slabs:** fixed 64KB blocks from a global lock-free freelist. Uniform size
-  keeps the pool trivial; duration per slab varies with fork rate
-  (64KB = 1s at 16kHz stereo, 4s at 8kHz mono).
+- **Slabs:** fixed 64KB blocks from a global freelist (mutex-guarded: slab
+  acquisition happens on shard/control threads, never on the media path, so
+  the uncontended mutex is simpler and TSan-friendlier than lock-freedom that
+  buys nothing). Uniform size keeps the pool trivial; duration per slab varies
+  with fork rate (64KB = 1s at 16kHz stereo, 4s at 8kHz mono).
 - **Per-fork cap:** `10s × bytes/sec` for the send ring (drop-oldest on overflow +
   `overrun` event with gap accounting). Healthy forks hold ~2 slabs; you pay for
   stalls only when they happen. Steady state at 1k calls ≈ 50–100MB, worst case
