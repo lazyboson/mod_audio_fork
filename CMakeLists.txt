@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# core/ and net/ are static archives linked into a shared module, so every
+# object in them must be position-independent (implicit on macOS, not on Linux).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(audiofork_warnings INTERFACE)
 target_compile_options(audiofork_warnings INTERFACE -Wall -Wextra -Werror -Wshadow)

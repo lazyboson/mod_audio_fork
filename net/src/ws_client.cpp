@@ -76,11 +76,6 @@ void EnsureLwsLogPolicy() {
   (void)configured;
 }
 
-std::mutex& LwsLifecycleMutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
 WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes)
     : handler_(handler), max_queued_bytes_(max_queued_bytes) {}
 
@@ -128,7 +123,6 @@ std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
   info.port = CONTEXT_PORT_NO_LISTEN;
   info.protocols = kProtocols.data();
   info.user = loop.get();
-  const std::scoped_lock lifecycle(LwsLifecycleMutex());
   loop->context_ = lws_create_context(&info);
   if (loop->context_ == nullptr) {
     return nullptr;
@@ -145,7 +139,6 @@ WsEventLoop::~WsEventLoop() {
   if (context_ != nullptr) {
     // fires LWS_CALLBACK_CLIENT_CLOSED for every live wsi, so handlers still
     // receive OnClosed during destruction
-    const std::scoped_lock lifecycle(LwsLifecycleMutex());
     lws_context_destroy(context_);
   }
   connections_.clear();

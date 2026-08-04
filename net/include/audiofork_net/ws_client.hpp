@@ -22,12 +22,6 @@ namespace audiofork::net {
 
 class WsEventLoop;
 
-// Guards lws context creation/destruction, which mutate non-atomic globals
-// shared by every context in the process. Anything else in this process that
-// creates lws contexts (FreeSWITCH's mod_verto does) is outside this guard —
-// see DESIGN.md §13.
-[[nodiscard]] std::mutex& LwsLifecycleMutex();
-
 // Owns the lws scheduler entry backing the repeating tick; defined in the
 // implementation so lws types stay out of this header.
 struct TickHandle;

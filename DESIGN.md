@@ -271,10 +271,12 @@ both touched by every wsi create and destroy — with a mutex only in SMP-aware
 builds. At the default `LWS_MAX_SMP=1` those counters are unguarded, and one
 context per shard thread corrupts them: asserting in debug builds, silently
 miscounting in release. `LWS_WITH_NETLINK` is also off (Linux route monitoring
-we never use, whose POLLIN handler races across contexts). Context creation and
-destruction are additionally serialised in the shim; note that anything else in
-the process holding lws contexts — FreeSWITCH's own `mod_verto` — is outside
-that guard, so avoid loading both until this is validated.
+we never use, whose POLLIN handler races across contexts). With SMP-aware
+locking in place lws guards these itself, so the shim adds no locking of its own
+— an outer mutex around context creation inverts lock order against lws's
+internal refcount mutex. Note that `mod_verto` also links libwebsockets: two
+independently built lws copies in one process are untested here, so avoid
+loading both until validated.
 
 | Dependency | Stage | Strategy |
 |---|---|---|
