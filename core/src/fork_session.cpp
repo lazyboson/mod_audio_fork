@@ -104,6 +104,32 @@ void ForkSession::Stop() {
   net_.Post([self] { self->Apply(self->state_.OnEvent(SessionEvent::kTeardown).action); });
 }
 
+bool ForkSession::SendText(std::string text) {
+  switch (state_.state()) {
+    case SessionState::kConnecting:
+    case SessionState::kActive:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      return false;
+  }
+  // may be called from a control or FreeSWITCH session thread: never touch the
+  // connection here, only hop to the shard
+  auto self = shared_from_this();
+  net_.Post([self, text = std::move(text)]() mutable { self->DeliverText(std::move(text)); });
+  return true;
+}
+
+bool ForkSession::SendDtmf(char digit, std::uint32_t duration_ms) {
+  auto encoded = EncodeDtmf(digit, duration_ms);
+  if (!encoded.has_value()) {
+    return false;
+  }
+  return SendText(std::move(*encoded));
+}
+
 void ForkSession::Pump() {
   DrainHandoffRing();
   PumpPlayback();
@@ -241,6 +267,7 @@ void ForkSession::Apply(SessionAction action) {
         Emit(ForkEventType::kConnect);
       }
       disconnected_at_.reset();
+      FlushPendingTexts();
       Pump();
       return;
     }
@@ -303,6 +330,9 @@ void ForkSession::Finalize() {
   // free slabs now rather than at destruction: a pending retry timer may hold
   // the last reference for seconds after the call is gone
   buffer_.Clear();
+  pending_texts_dropped_.fetch_add(static_cast<std::uint64_t>(pending_texts_.size()),
+                                   std::memory_order_relaxed);
+  pending_texts_.clear();
   if (playback_.has_value()) {
     playback_->Clear();
     if (playback_started_) {
@@ -362,6 +392,51 @@ void ForkSession::FlushToConnection() {
     sent_bytes_.fetch_add(chunk.size(), std::memory_order_relaxed);
   }
   buffered_bytes_.store(buffer_.size(), std::memory_order_relaxed);
+}
+
+void ForkSession::DeliverText(std::string text) {
+  bool sendable = false;
+  switch (state_.state()) {
+    case SessionState::kActive:
+      // Active with no socket: a late handshake abandoned this one, and the
+      // reconnect that follows is what will flush the queue
+      sendable = connection_ != nullptr;
+      break;
+    case SessionState::kConnecting:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      pending_texts_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+  }
+  if (!sendable) {
+    QueueText(std::move(text));
+    return;
+  }
+  if (!connection_->SendText(text)) {
+    pending_texts_dropped_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void ForkSession::QueueText(std::string text) {
+  if (pending_texts_.size() >= kMaxPendingTexts) {
+    pending_texts_.pop_front();
+    pending_texts_dropped_.fetch_add(1, std::memory_order_relaxed);
+  }
+  pending_texts_.push_back(std::move(text));
+}
+
+void ForkSession::FlushPendingTexts() {
+  // a refused send is a drop, not a retry: nothing re-flushes this queue before
+  // the next reconnect, so leaving entries behind would only delay the loss
+  for (const auto& text : pending_texts_) {
+    if (connection_ == nullptr || !connection_->SendText(text)) {
+      pending_texts_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  pending_texts_.clear();
 }
 
 void ForkSession::Emit(ForkEventType type, std::string detail) {
@@ -468,7 +543,8 @@ ForkSession::Stats ForkSession::stats() const {
                playback_bytes_played_.load(std::memory_order_relaxed),
                playback_underruns_.load(std::memory_order_relaxed),
                barge_ins_.load(std::memory_order_relaxed),
-               playback_buffered_bytes_.load(std::memory_order_relaxed)};
+               playback_buffered_bytes_.load(std::memory_order_relaxed),
+               pending_texts_dropped_.load(std::memory_order_relaxed)};
 }
 
 }  // namespace audiofork
