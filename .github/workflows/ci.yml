@@ -58,6 +58,63 @@ jobs:
           grep -q libssl.so linked.txt
           grep -q libcrypto.so linked.txt
 
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe needs the tags, which the default shallow fetch omits
+          fetch-depth: 0
+      - name: build the runtime image
+        run: |
+          docker build --build-arg AUDIOFORK_VERSION="$(git describe --tags --always)" \
+            -t mod_audio_fork:ci .
+      - name: extract the SBOM
+        run: |
+          docker run --rm mod_audio_fork:ci \
+            cat /usr/share/doc/mod_audio_fork/sbom.cdx.json > sbom.cdx.json
+      - name: the SBOM must name the pins this build actually used
+        run: |
+          python3 - <<'PY'
+          import json, re
+
+          bom = json.load(open("sbom.cdx.json"))
+          assert bom["bomFormat"] == "CycloneDX", bom["bomFormat"]
+          assert bom["specVersion"] == "1.5", bom["specVersion"]
+          assert bom["metadata"]["component"]["name"] == "mod_audio_fork"
+          assert bom["metadata"]["component"]["version"], "no version for the module itself"
+
+          by_ref = {c["bom-ref"]: c for c in bom["components"]}
+
+          def pinned(path, pattern):
+              match = re.search(pattern, open(path).read())
+              assert match, f"no pin matching {pattern} in {path}"
+              return match.group(1)
+
+          expected = {
+              "libwebsockets": pinned(
+                  "net/CMakeLists.txt",
+                  r"URL https://github\.com/warmcat/libwebsockets/archive/refs/tags/v(\S+)\.tar\.gz"),
+              "nlohmann-json": pinned(
+                  "core/CMakeLists.txt",
+                  r"URL https://github\.com/nlohmann/json/releases/download/v(\S+)/"),
+          }
+          for ref, version in expected.items():
+              assert by_ref[ref]["version"] == version, (ref, by_ref[ref]["version"], version)
+
+          assert by_ref["libwebsockets"]["pedigree"]["patches"], "the lws patch is not declared"
+          assert by_ref["openssl"]["purl"].startswith("pkg:apk/alpine/"), by_ref["openssl"]["purl"]
+          assert by_ref["openssl"]["version"], "no version for the system OpenSSL"
+
+          for component in bom["components"]:
+              print(component["name"], component["version"], component["purl"])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
   rig-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
