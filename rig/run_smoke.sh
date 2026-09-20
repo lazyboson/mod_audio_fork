@@ -31,7 +31,10 @@ wait_for_exit() {
   done
 }
 
-$COMPOSE up --build -d
+# built once, not per service: freeswitch and smoke share one image tag, and
+# building both at once makes buildkit race on the export
+$COMPOSE build freeswitch
+$COMPOSE up -d
 
 smoke_code=$(wait_for_exit smoke)
 fs_code=$(wait_for_exit freeswitch)
