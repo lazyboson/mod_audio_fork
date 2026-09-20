@@ -35,6 +35,11 @@ cmake --preset release && cmake --build --preset release --target mod_audio_fork
 Install `build/release/module/mod_audio_fork.so` into FreeSWITCH's module
 directory and `conf/audio_fork.conf.xml` into `conf/autoload_configs/`.
 
+On musl builds of FreeSWITCH (Alpine), also set
+`<param name="session-thread-pool" value="false"/>` in `switch.conf.xml`:
+without it FreeSWITCH 1.10.12 SIGSEGVs at shutdown once any session has carried
+a playback media bug (DESIGN.md §13).
+
 ## Using it
 
 ```

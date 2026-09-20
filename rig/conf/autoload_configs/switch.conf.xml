@@ -6,6 +6,12 @@
          them into failures. -->
     <param name="sessions-per-second" value="200"/>
     <param name="max-db-handles" value="10"/>
+    <!-- FreeSWITCH 1.10.12 on musl SIGSEGVs at shutdown in
+         switch_core_session_thread_pool_worker's pool destroy once any session
+         has carried an SMBF_WRITE_REPLACE media bug; reproducible with stock
+         uuid_displace and no module loaded. One thread per session avoids the
+         faulting path. -->
+    <param name="session-thread-pool" value="false"/>
     <param name="rtp-enable-zrtp" value="false"/>
   </settings>
 </configuration>

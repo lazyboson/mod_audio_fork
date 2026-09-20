@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +36,13 @@ class TestWsServer {
   // Queue a text or binary frame to every live connection (playback tests).
   void Broadcast(std::string payload, bool binary);
   [[nodiscard]] int total_connections() const { return total_connections_.load(); }
+  // Ordered record of what the server saw across every connection:
+  // "text:<payload>", "binary:<byte count>", and "close" when the peer sent a
+  // close frame. A peer that resets the socket instead never adds "close".
+  [[nodiscard]] std::vector<std::string> transcript() const;
+  // Every connection established from now on completes the handshake and then
+  // never reads, so a client's send queue cannot drain.
+  void StopReadingNewConnections();
   void CloseAllConnections();
 
   [[nodiscard]] int HandleLws(lws* wsi, int reason, void* in, std::size_t len);
@@ -47,13 +55,17 @@ class TestWsServer {
 
   void Post(std::function<void()> task);
   void DrainPosted();
+  void Record(std::string entry);
 
   lws_context* context_ = nullptr;
   std::uint16_t port_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int> total_connections_{0};
+  std::atomic<bool> stop_reading_{false};
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;
+  mutable std::mutex transcript_mutex_;
+  std::vector<std::string> transcript_;
   std::unordered_map<lws*, PerConnection> connections_;
   std::thread thread_;
 };

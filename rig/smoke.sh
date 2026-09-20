@@ -21,6 +21,10 @@ MEAN_ABS_MIN=1000
 
 cli() { "$FS_CLI" -H 127.0.0.1 -x "$1"; }
 
+# run_smoke.sh judges the FreeSWITCH container's exit code, so FreeSWITCH has
+# to be asked to shut down on every exit from here, pass or fail
+trap 'cli "fsctl shutdown" >/dev/null 2>&1 || true' EXIT
+
 fail() {
   echo "SMOKE FAIL: $1" >&2
   exit 1
@@ -77,8 +81,19 @@ sent=$(expect_num sent_bytes "streaming" "$status")
 played=$(expect_num playback_bytes_played "streaming" "$status")
 [ "$played" -gt 0 ] || fail "server audio never reached the caller: playback_bytes_played=$played"
 
+# stop before kill, and assert the graceful goodbye before killing anything:
+# a killed channel tears the socket down for reasons of its own, so a bye
+# counted after the kill would prove nothing about the stop path
 for uuid in $uuids; do
   cli "uuid_audio_fork $uuid stop" >/dev/null || true
+done
+sleep 4
+
+[ -f "$REPORT" ] || fail "mock server wrote no report at $REPORT"
+byes=$(expect_num bye_count "graceful stop" "$(cat "$REPORT")")
+[ "$byes" -eq "$CALLS" ] || fail "expected $CALLS byes after graceful stop, got $byes"
+
+for uuid in $uuids; do
   cli "uuid_kill $uuid" >/dev/null || true
 done
 sleep 3

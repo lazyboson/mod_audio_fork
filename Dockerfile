@@ -13,11 +13,16 @@ COPY core core
 COPY net net
 COPY module module
 
+# AUDIOFORK_STRIP=0 builds RelWithDebInfo and skips the strip, so a crash in a
+# rig container has a symbolised backtrace. The shipped image keeps the default.
+ARG AUDIOFORK_STRIP=1
+
 # lws and nlohmann/json are fetched and statically linked here (DESIGN.md §13)
-RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+RUN if [ "$AUDIOFORK_STRIP" = "0" ]; then BUILD_TYPE=RelWithDebInfo; else BUILD_TYPE=Release; fi && \
+    cmake -S . -B /build -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DBUILD_TESTING=OFF \
       -DAUDIOFORK_BUILD_MODULE=ON && \
     cmake --build /build --parallel && \
-    strip /build/module/mod_audio_fork.so
+    { [ "$AUDIOFORK_STRIP" = "0" ] || strip /build/module/mod_audio_fork.so; }
 
 # Runtime stage: only the module and its config land in the image. Point this at
 # whatever FreeSWITCH base image you deploy; the module resolves switch_*

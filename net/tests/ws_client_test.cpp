@@ -26,6 +26,7 @@ struct RecordingHandler : WsConnectionHandler {
   std::condition_variable cv;
   bool connected = false;
   bool closed = false;
+  int close_count = 0;
   bool connect_failed = false;
   std::vector<std::string> texts;
   std::vector<std::vector<std::uint8_t>> binaries;
@@ -48,6 +49,7 @@ struct RecordingHandler : WsConnectionHandler {
   void OnClosed(bool failed) override {
     const std::scoped_lock lock(mutex);
     closed = true;
+    ++close_count;
     connect_failed = failed;
     cv.notify_all();
   }
@@ -60,10 +62,11 @@ struct RecordingHandler : WsConnectionHandler {
 };
 
 struct LoopRunner {
-  std::unique_ptr<WsEventLoop> loop = WsEventLoop::Create();
+  std::unique_ptr<WsEventLoop> loop;
   std::thread thread;
 
-  LoopRunner() {
+  explicit LoopRunner(std::chrono::milliseconds close_drain_timeout = 5000ms)
+      : loop(WsEventLoop::Create(close_drain_timeout)) {
     EXPECT_NE(loop, nullptr);
     thread = std::thread([this] { loop->Run(); });
   }
@@ -72,6 +75,18 @@ struct LoopRunner {
     thread.join();
   }
 };
+
+// The server records on its own thread, so poll rather than sleep a fixed time.
+[[nodiscard]] bool WaitForTranscript(const TestWsServer& server, std::size_t entries) {
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (server.transcript().size() >= entries) {
+      return true;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return false;
+}
 
 std::uint16_t FindClosedPort() {
   auto server = TestWsServer::Start();
@@ -249,6 +264,154 @@ TEST(WsClient, ReconnectWithBackoffEventuallySucceeds) {
     std::this_thread::sleep_for(1ms);
   }
   EXPECT_EQ(server->total_connections(), 1);
+}
+
+TEST(WsClient, QueuedFrameIsWrittenBeforeTheCloseHandshake) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+
+  struct ByeHandler : RecordingHandler {
+    WsConnection* self = nullptr;
+    void OnConnected() override {
+      RecordingHandler::OnConnected();
+      EXPECT_TRUE(self->SendText(R"({"type":"bye"})"));
+      self->Close();
+    }
+  };
+  ByeHandler sender;
+  LoopRunner runner;
+  runner.loop->Post([&] {
+    sender.self =
+        runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender, kDefaultQueueCap);
+    ASSERT_NE(sender.self, nullptr);
+  });
+
+  ASSERT_TRUE(WaitForTranscript(*server, 2));
+  EXPECT_EQ(server->transcript(), (std::vector<std::string>{R"(text:{"type":"bye"})", "close"}));
+  EXPECT_TRUE(sender.WaitFor([&] { return sender.closed; }));
+}
+
+TEST(WsClient, EveryQueuedFrameArrivesInOrderBeforeTheClose) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+
+  struct BurstHandler : RecordingHandler {
+    WsConnection* self = nullptr;
+    void OnConnected() override {
+      RecordingHandler::OnConnected();
+      const std::vector<std::uint8_t> pcm(320, 7);
+      EXPECT_TRUE(self->SendText("one"));
+      EXPECT_TRUE(self->SendBinary(ConstByteSpan(pcm)));
+      EXPECT_TRUE(self->SendText("three"));
+      self->Close();
+    }
+  };
+  BurstHandler sender;
+  LoopRunner runner;
+  runner.loop->Post([&] {
+    sender.self =
+        runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender, kDefaultQueueCap);
+    ASSERT_NE(sender.self, nullptr);
+  });
+
+  ASSERT_TRUE(WaitForTranscript(*server, 4));
+  EXPECT_EQ(server->transcript(),
+            (std::vector<std::string>{"text:one", "binary:320", "text:three", "close"}));
+}
+
+TEST(WsClient, SendAfterCloseIsRefused) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+
+  struct RefusingHandler : RecordingHandler {
+    WsConnection* self = nullptr;
+    bool text_refused = false;
+    bool binary_refused = false;
+    void OnConnected() override {
+      self->Close();
+      const std::vector<std::uint8_t> pcm(320);
+      const bool text = !self->SendText("late");
+      const bool binary = !self->SendBinary(ConstByteSpan(pcm));
+      {
+        const std::scoped_lock lock(mutex);
+        text_refused = text;
+        binary_refused = binary;
+      }
+      // last: publishes the flags-before-connected ordering WaitFor relies on
+      RecordingHandler::OnConnected();
+    }
+  };
+  RefusingHandler sender;
+  LoopRunner runner;
+  runner.loop->Post([&] {
+    sender.self =
+        runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender, kDefaultQueueCap);
+    ASSERT_NE(sender.self, nullptr);
+  });
+
+  ASSERT_TRUE(sender.WaitFor([&] { return sender.connected; }));
+  EXPECT_TRUE(sender.text_refused);
+  EXPECT_TRUE(sender.binary_refused);
+  ASSERT_TRUE(WaitForTranscript(*server, 1));
+  EXPECT_EQ(server->transcript(), (std::vector<std::string>{"close"}));
+}
+
+TEST(WsClient, CloseBeforeEstablishedDeliversOneConnectFailure) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  RecordingHandler handler;
+  LoopRunner runner;
+
+  // still in the handshake: Connect returns before the server's reply, so this
+  // is the close-while-connecting path, not the close-while-established one
+  runner.loop->Post([&] {
+    WsConnection* connection =
+        runner.loop->Connect({"127.0.0.1", server->port(), "/"}, handler, kDefaultQueueCap);
+    ASSERT_NE(connection, nullptr);
+    connection->Close();
+    connection->Close();
+  });
+
+  ASSERT_TRUE(handler.WaitFor([&] { return handler.closed; }));
+  EXPECT_TRUE(handler.connect_failed);
+  EXPECT_FALSE(handler.connected);
+  EXPECT_FALSE(handler.WaitFor([&] { return handler.close_count > 1; }, 500ms));
+  EXPECT_EQ(handler.close_count, 1);
+}
+
+TEST(WsClient, CloseIsBoundedWhenThePeerStopsReading) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  server->StopReadingNewConnections();
+
+  struct StalledHandler : RecordingHandler {
+    WsConnection* self = nullptr;
+    int queued = 0;
+    void OnConnected() override {
+      const std::vector<std::uint8_t> chunk(std::size_t{64} * 1024, 0xAB);
+      while (self->SendBinary(ConstByteSpan(chunk))) {
+        ++queued;
+      }
+      self->Close();
+      // last: publishes the flags-before-connected ordering WaitFor relies on
+      RecordingHandler::OnConnected();
+    }
+  };
+  StalledHandler sender;
+  LoopRunner runner{200ms};
+  runner.loop->Post([&] {
+    sender.self = runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender,
+                                       /*max_queued_bytes=*/std::size_t{4} * 1024 * 1024);
+    ASSERT_NE(sender.self, nullptr);
+  });
+
+  ASSERT_TRUE(sender.WaitFor([&] { return sender.closed; }, 10s));
+  EXPECT_FALSE(sender.connect_failed);
+  EXPECT_FALSE(sender.WaitFor([&] { return sender.close_count > 1; }, 500ms));
+  EXPECT_EQ(sender.close_count, 1);
+  // the peer never read, so the queue the handler filled cannot have drained
+  EXPECT_GT(sender.queued, 1);
+  EXPECT_LT(server->transcript().size(), static_cast<std::size_t>(sender.queued));
 }
 
 }  // namespace

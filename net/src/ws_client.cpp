@@ -76,8 +76,11 @@ void EnsureLwsLogPolicy() {
   (void)configured;
 }
 
-WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes)
-    : handler_(handler), max_queued_bytes_(max_queued_bytes) {}
+WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes,
+                           std::chrono::milliseconds close_drain_timeout)
+    : handler_(handler),
+      max_queued_bytes_(max_queued_bytes),
+      close_drain_timeout_(close_drain_timeout) {}
 
 bool WsConnection::SendText(std::string_view text) {
   return Enqueue(ConstByteSpan(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()),
@@ -100,6 +103,10 @@ void WsConnection::Close() {
   }
   close_requested_ = true;
   if (wsi_ != nullptr && established_) {
+    // a peer that stops reading would otherwise pin the socket for as long as
+    // it stays silent: lws force-closes the wsi when this expires
+    lws_set_timeout_us(wsi_, PENDING_TIMEOUT_CLOSE_SEND,
+                       static_cast<lws_usec_t>(close_drain_timeout_.count()) * LWS_US_PER_MS);
     lws_callback_on_writable(wsi_);
   } else if (wsi_ != nullptr) {
     // connect still in flight: force lws to give up on it now
@@ -124,9 +131,10 @@ bool WsConnection::Enqueue(ConstByteSpan bytes, bool binary) {
   return true;
 }
 
-std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
+std::unique_ptr<WsEventLoop> WsEventLoop::Create(std::chrono::milliseconds close_drain_timeout) {
   EnsureLwsLogPolicy();
   auto loop = std::make_unique<WsEventLoop>(PrivateTag{});
+  loop->close_drain_timeout_ = close_drain_timeout;
   lws_context_creation_info info{};
   info.port = CONTEXT_PORT_NO_LISTEN;
   info.protocols = kProtocols.data();
@@ -211,8 +219,8 @@ void WsEventLoop::Post(std::function<void()> task) {
 
 WsConnection* WsEventLoop::Connect(const WsEndpoint& endpoint, WsConnectionHandler& handler,
                                    std::size_t max_queued_bytes) {
-  auto owned =
-      std::make_unique<WsConnection>(WsConnection::PrivateTag{}, handler, max_queued_bytes);
+  auto owned = std::make_unique<WsConnection>(WsConnection::PrivateTag{}, handler, max_queued_bytes,
+                                              close_drain_timeout_);
   WsConnection* connection = owned.get();
 
   lws_client_connect_info info{};
@@ -280,10 +288,8 @@ int WsEventLoop::HandleLws(lws* wsi, int reason, void* user, void* in, std::size
       if (connection == nullptr) {
         return 0;
       }
-      if (connection->close_requested_) {
-        lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
-        return -1;
-      }
+      // Close() is graceful: the queue drains before the close handshake, or
+      // the bye frame the session enqueued last would never reach the peer
       if (!connection->outgoing_.empty()) {
         WsConnection::Outgoing& front = connection->outgoing_.front();
         const std::size_t payload_len = front.padded_payload.size() - LWS_PRE;
@@ -294,9 +300,14 @@ int WsEventLoop::HandleLws(lws* wsi, int reason, void* user, void* in, std::size
         }
         connection->queued_bytes_ -= payload_len;
         connection->outgoing_.pop_front();
-        if (!connection->outgoing_.empty()) {
-          lws_callback_on_writable(wsi);
-        }
+      }
+      if (!connection->outgoing_.empty()) {
+        lws_callback_on_writable(wsi);
+        return 0;
+      }
+      if (connection->close_requested_) {
+        lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
+        return -1;
       }
       return 0;
     }

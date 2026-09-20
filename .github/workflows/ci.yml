@@ -48,13 +48,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: 50-call smoke with audio-integrity assertions
-        run: |
-          docker compose -f rig/docker-compose.yml up --build \
-            --abort-on-container-exit --exit-code-from smoke
-      - name: collect rig logs
-        if: failure()
-        run: docker compose -f rig/docker-compose.yml logs --no-color > rig-logs.txt
+      - name: 50-call smoke, audio integrity and a clean FreeSWITCH shutdown
+        run: ./rig/run_smoke.sh
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
