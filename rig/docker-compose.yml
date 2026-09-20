@@ -2,7 +2,7 @@ x-module-image: &module-image
   build:
     context: ..
     dockerfile: Dockerfile
-  image: afrig-freeswitch
+  image: ${AUDIOFORK_IMAGE:-afrig-freeswitch}
 
 services:
   mock-ws:

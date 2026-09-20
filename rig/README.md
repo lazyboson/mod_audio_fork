@@ -54,6 +54,11 @@ stack up, waits for the smoke to finish, waits for FreeSWITCH to exit (the
 smoke's last act is `fsctl shutdown`), asserts both exit codes are 0, writes
 the full rig logs to `rig-logs.txt`, and tears the stack down with `down -v`.
 
+It names the compose project and the built image after the worktree
+(`afrig-<checkout>`), so two checkouts of this repo on one host do not share
+containers or overwrite each other's image; `COMPOSE_PROJECT_NAME` and
+`AUDIOFORK_IMAGE` override that.
+
 | Knob | Where | Default | Effect |
 |---|---|---|---|
 | `CALLS` | compose environment | 50 | concurrent calls the smoke originates |

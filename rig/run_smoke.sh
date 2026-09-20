@@ -6,6 +6,11 @@
 set -eu
 
 RIG_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# One project and one image tag per worktree: several checkouts of this repo on
+# one host would otherwise share containers and overwrite each other's image.
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-afrig-$(basename "$(git -C "$RIG_DIR" rev-parse --show-toplevel)")}
+AUDIOFORK_IMAGE=${AUDIOFORK_IMAGE:-$COMPOSE_PROJECT_NAME-freeswitch}
+export COMPOSE_PROJECT_NAME AUDIOFORK_IMAGE
 COMPOSE="docker compose -f $RIG_DIR/docker-compose.yml"
 RIG_LOG_FILE=${RIG_LOG_FILE:-rig-logs.txt}
 EXIT_TIMEOUT_SECONDS=${EXIT_TIMEOUT_SECONDS:-180}
@@ -35,6 +40,7 @@ $COMPOSE logs --no-color > "$RIG_LOG_FILE" 2>&1 || true
 $COMPOSE logs --no-color --no-log-prefix smoke 2>/dev/null || true
 $COMPOSE down -v >/dev/null 2>&1 || true
 
+echo "compose project: $COMPOSE_PROJECT_NAME (image $AUDIOFORK_IMAGE)"
 echo "smoke exit code: ${smoke_code:-<still running>}"
 echo "freeswitch exit code: ${fs_code:-<still running>}"
 echo "full rig logs: $RIG_LOG_FILE"
