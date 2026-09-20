@@ -8,6 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # core/ and net/ are static archives linked into a shared module, so every
 # object in them must be position-independent (implicit on macOS, not on Linux).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Same reason for visibility: the archives' objects carry into the .so, so
+# hiding only the module's own objects would still export core/ and net/.
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 add_library(audiofork_warnings INTERFACE)
 target_compile_options(audiofork_warnings INTERFACE -Wall -Wextra -Werror -Wshadow)

@@ -35,19 +35,19 @@ jobs:
           cmake -S . -B build/module -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
             -DAUDIOFORK_BUILD_MODULE=ON
           cmake --build build/module --parallel
-      - name: the module must export the FreeSWITCH interface and no lws symbols
+      - name: the interface symbol must be the only thing the module exports
         run: |
-          nm -D --defined-only build/module/module/mod_audio_fork.so > exported.txt
-          grep -q mod_audio_fork_module_interface exported.txt
-          if grep -q ' lws_' exported.txt; then
-            echo "vendored libwebsockets symbols leaked into the module" >&2
-            exit 1
-          fi
-          # OpenSSL must be imported from the host so the module shares the one
-          # FreeSWITCH already loaded; a defined SSL_/CRYPTO_ means it got
-          # linked in statically (DESIGN.md §13)
-          if grep -qE ' (SSL_|CRYPTO_|OPENSSL_)' exported.txt; then
-            echo "OpenSSL symbols are defined by the module instead of imported" >&2
+          nm -D --defined-only build/module/module/mod_audio_fork.so |
+            awk '{ print $NF }' | sort > exported.txt
+          grep -qx mod_audio_fork_module_interface exported.txt
+          # Anything else is a leak: vendored lws, a statically linked OpenSSL
+          # instead of the one FreeSWITCH already loaded, nlohmann/json, or
+          # core/ internals (DESIGN.md §13). The linker-defined names are
+          # allowed because ld may keep them global despite the version script.
+          leaked=$(grep -vxE '(mod_audio_fork_module_interface|_init|_fini|__bss_start|_edata|_end)' exported.txt || true)
+          if [ -n "$leaked" ]; then
+            echo "$leaked" >&2
+            echo "the symbols above leak out of mod_audio_fork.so" >&2
             exit 1
           fi
       - name: the module must link libssl and libcrypto dynamically

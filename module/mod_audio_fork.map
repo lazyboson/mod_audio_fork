@@ -1,0 +1,6 @@
+{
+  global:
+    mod_audio_fork_module_interface;
+  local:
+    *;
+};
