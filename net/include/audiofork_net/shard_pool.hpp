@@ -44,7 +44,8 @@ class LwsNetPort : public NetPort {
 // context, closes it by construction.
 class Shard {
  public:
-  [[nodiscard]] static std::unique_ptr<Shard> Create(std::chrono::milliseconds tick);
+  [[nodiscard]] static std::unique_ptr<Shard> Create(std::chrono::milliseconds tick,
+                                                    const TlsOptions& tls);
   void StartThread();
   void StopThread();
   ~Shard();

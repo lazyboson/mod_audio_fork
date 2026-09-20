@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "audiofork/bytes.hpp"
+#include "audiofork/config.hpp"
 
 struct lws;
 struct lws_context;
@@ -47,6 +48,7 @@ struct WsEndpoint {
   std::string host;
   std::uint16_t port = 0;
   std::string path = "/";
+  bool tls = false;
 };
 
 class WsEventLoop;
@@ -92,9 +94,12 @@ class WsEventLoop {
   struct PrivateTag {};
 
  public:
-  [[nodiscard]] static std::unique_ptr<WsEventLoop> Create();
+  // The TLS material applies to every connection this loop makes; lws reads the
+  // paths only while the context is being created, so `tls` need not outlive
+  // the call.
+  [[nodiscard]] static std::unique_ptr<WsEventLoop> Create(const TlsOptions& tls = {});
 
-  explicit WsEventLoop(PrivateTag);
+  WsEventLoop(PrivateTag, bool verify_peer);
   ~WsEventLoop();
   WsEventLoop(const WsEventLoop&) = delete;
   WsEventLoop& operator=(const WsEventLoop&) = delete;
@@ -127,6 +132,7 @@ class WsEventLoop {
   void FinishConnection(WsConnection& connection, bool connect_failed);
 
   lws_context* context_ = nullptr;
+  const bool verify_peer_;
   std::atomic<bool> stop_{false};
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;

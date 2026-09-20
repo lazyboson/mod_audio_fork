@@ -124,13 +124,24 @@ bool WsConnection::Enqueue(ConstByteSpan bytes, bool binary) {
   return true;
 }
 
-std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
+std::unique_ptr<WsEventLoop> WsEventLoop::Create(const TlsOptions& tls) {
   EnsureLwsLogPolicy();
-  auto loop = std::make_unique<WsEventLoop>(PrivateTag{});
+  auto loop = std::make_unique<WsEventLoop>(PrivateTag{}, tls.verify);
   lws_context_creation_info info{};
   info.port = CONTEXT_PORT_NO_LISTEN;
   info.protocols = kProtocols.data();
   info.user = loop.get();
+  // without this lws never builds a client SSL context, whatever the
+  // per-connection flags say (lws_context_init_client_ssl)
+  info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+  // lws offers a CA file or an in-memory CA, never a directory
+  if (!tls.ca_file.empty()) {
+    info.client_ssl_ca_filepath = tls.ca_file.c_str();
+  }
+  if (!tls.cert_file.empty()) {
+    info.client_ssl_cert_filepath = tls.cert_file.c_str();
+    info.client_ssl_private_key_filepath = tls.key_file.c_str();
+  }
   loop->context_ = lws_create_context(&info);
   if (loop->context_ == nullptr) {
     return nullptr;
@@ -138,7 +149,7 @@ std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
   return loop;
 }
 
-WsEventLoop::WsEventLoop(PrivateTag) {}
+WsEventLoop::WsEventLoop(PrivateTag, bool verify_peer) : verify_peer_(verify_peer) {}
 
 WsEventLoop::~WsEventLoop() {
   // the tick's sul lives on a list owned by the context, so it must be
@@ -225,6 +236,13 @@ WsConnection* WsEventLoop::Connect(const WsEndpoint& endpoint, WsConnectionHandl
   info.protocol = kProtocolName;
   info.userdata = connection;
   info.pwsi = &connection->wsi_;
+  if (endpoint.tls) {
+    info.ssl_connection = LCCSCF_USE_SSL;
+    if (!verify_peer_) {
+      info.ssl_connection |= LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK |
+                             LCCSCF_ALLOW_INSECURE | LCCSCF_ALLOW_EXPIRED;
+    }
+  }
 
   if (lws_client_connect_via_info(&info) == nullptr || connection->closed_delivered_) {
     return nullptr;
