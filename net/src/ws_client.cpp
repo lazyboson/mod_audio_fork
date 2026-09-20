@@ -12,6 +12,7 @@ namespace {
 
 constexpr const char* kProtocolName = "audiofork";
 constexpr std::size_t kRxBufferBytes = std::size_t{64} * 1024;
+constexpr int kCloseDrainTimeoutSeconds = 5;
 
 int RawLwsCallback(lws* wsi, lws_callback_reasons reason, void* user, void* in, std::size_t len) {
   auto* loop = static_cast<WsEventLoop*>(lws_context_user(lws_get_context(wsi)));
@@ -100,6 +101,9 @@ void WsConnection::Close() {
   }
   close_requested_ = true;
   if (wsi_ != nullptr && established_) {
+    // a peer that stops reading would otherwise pin the socket for as long as
+    // it stays silent: lws force-closes the wsi when this expires
+    lws_set_timeout(wsi_, PENDING_TIMEOUT_CLOSE_SEND, kCloseDrainTimeoutSeconds);
     lws_callback_on_writable(wsi_);
   } else if (wsi_ != nullptr) {
     // connect still in flight: force lws to give up on it now
@@ -280,10 +284,8 @@ int WsEventLoop::HandleLws(lws* wsi, int reason, void* user, void* in, std::size
       if (connection == nullptr) {
         return 0;
       }
-      if (connection->close_requested_) {
-        lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
-        return -1;
-      }
+      // Close() is graceful: the queue drains before the close handshake, or
+      // the bye frame the session enqueued last would never reach the peer
       if (!connection->outgoing_.empty()) {
         WsConnection::Outgoing& front = connection->outgoing_.front();
         const std::size_t payload_len = front.padded_payload.size() - LWS_PRE;
@@ -294,9 +296,14 @@ int WsEventLoop::HandleLws(lws* wsi, int reason, void* user, void* in, std::size
         }
         connection->queued_bytes_ -= payload_len;
         connection->outgoing_.pop_front();
-        if (!connection->outgoing_.empty()) {
-          lws_callback_on_writable(wsi);
-        }
+      }
+      if (!connection->outgoing_.empty()) {
+        lws_callback_on_writable(wsi);
+        return 0;
+      }
+      if (connection->close_requested_) {
+        lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
+        return -1;
       }
       return 0;
     }
