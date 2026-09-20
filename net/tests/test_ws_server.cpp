@@ -92,6 +92,16 @@ void TestWsServer::CloseAllConnections() {
   });
 }
 
+std::vector<std::string> TestWsServer::transcript() const {
+  const std::scoped_lock lock(transcript_mutex_);
+  return transcript_;
+}
+
+void TestWsServer::Record(std::string entry) {
+  const std::scoped_lock lock(transcript_mutex_);
+  transcript_.push_back(std::move(entry));
+}
+
 void TestWsServer::Post(std::function<void()> task) {
   {
     const std::scoped_lock lock(posted_mutex_);
@@ -130,9 +140,13 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
       }
       state.incoming.insert(state.incoming.end(), bytes, bytes + len);
       if (lws_is_final_fragment(wsi) != 0) {
+        const bool binary = lws_frame_is_binary(wsi) != 0;
+        Record(binary ? "binary:" + std::to_string(state.incoming.size())
+                      : "text:" + std::string(reinterpret_cast<const char*>(state.incoming.data()),
+                                              state.incoming.size()));
         std::vector<std::uint8_t> echo(LWS_PRE);
         echo.insert(echo.end(), state.incoming.begin(), state.incoming.end());
-        state.outgoing.emplace_back(std::move(echo), lws_frame_is_binary(wsi) != 0);
+        state.outgoing.emplace_back(std::move(echo), binary);
         state.incoming.clear();
         lws_callback_on_writable(wsi);
       }
@@ -156,6 +170,10 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
       }
       return 0;
     }
+
+    case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE:
+      Record("close");
+      return 0;
 
     case LWS_CALLBACK_CLOSED:
       connections_.erase(wsi);

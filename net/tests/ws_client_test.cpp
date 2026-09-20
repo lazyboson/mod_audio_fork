@@ -26,6 +26,7 @@ struct RecordingHandler : WsConnectionHandler {
   std::condition_variable cv;
   bool connected = false;
   bool closed = false;
+  int close_count = 0;
   bool connect_failed = false;
   std::vector<std::string> texts;
   std::vector<std::vector<std::uint8_t>> binaries;
@@ -48,6 +49,7 @@ struct RecordingHandler : WsConnectionHandler {
   void OnClosed(bool failed) override {
     const std::scoped_lock lock(mutex);
     closed = true;
+    ++close_count;
     connect_failed = failed;
     cv.notify_all();
   }
@@ -72,6 +74,18 @@ struct LoopRunner {
     thread.join();
   }
 };
+
+// The server records on its own thread, so poll rather than sleep a fixed time.
+[[nodiscard]] bool WaitForTranscript(const TestWsServer& server, std::size_t entries) {
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (server.transcript().size() >= entries) {
+      return true;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return false;
+}
 
 std::uint16_t FindClosedPort() {
   auto server = TestWsServer::Start();
