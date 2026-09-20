@@ -484,5 +484,162 @@ TEST(ForkSession, LongStallThenRecoveryKeepsNewestAudioAndAccountsDrops) {
   EXPECT_EQ(fx.session->stats().buffered_bytes, 0U);
 }
 
+TEST(ForkSession, SendTextIsForwardedVerbatimWhileActive) {
+  Fixture fx;
+  fx.Connect();
+  const std::string payload = R"({"app":"say this","weird":"a b\tc"})";
+  EXPECT_TRUE(fx.session->SendText(payload));
+  fx.net.RunPosted();
+
+  ASSERT_EQ(fx.net.live().texts.size(), 2U);
+  EXPECT_EQ(fx.net.live().texts[1], payload);
+  EXPECT_EQ(fx.session->stats().pending_texts_dropped, 0U);
+}
+
+TEST(ForkSession, SendTextBeforeConnectIsDeliveredAfterHelloInOrder) {
+  Fixture fx;
+  fx.session->Start();
+  EXPECT_TRUE(fx.session->SendText(R"({"n":1})"));
+  EXPECT_TRUE(fx.session->SendText(R"({"n":2})"));
+  fx.net.RunPosted();
+  EXPECT_TRUE(fx.net.live().texts.empty());
+
+  fx.net.handler().OnConnected();
+  ASSERT_EQ(fx.net.live().texts.size(), 3U);
+  EXPECT_EQ(json::parse(fx.net.live().texts[0])["type"], "hello");
+  EXPECT_EQ(fx.net.live().texts[1], R"({"n":1})");
+  EXPECT_EQ(fx.net.live().texts[2], R"({"n":2})");
+}
+
+TEST(ForkSession, SendTextDuringReconnectIsDeliveredAfterResume) {
+  Fixture fx;
+  fx.Connect();
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  ASSERT_EQ(fx.session->state(), SessionState::kReconnecting);
+  EXPECT_TRUE(fx.session->SendText(R"({"n":7})"));
+  fx.net.RunPosted();
+
+  ASSERT_TRUE(fx.net.FireOneTimer());
+  fx.net.handler().OnConnected();
+  ASSERT_EQ(fx.net.live().texts.size(), 3U);
+  EXPECT_EQ(json::parse(fx.net.live().texts[0])["type"], "hello");
+  EXPECT_EQ(json::parse(fx.net.live().texts[1])["type"], "resume");
+  EXPECT_EQ(fx.net.live().texts[2], R"({"n":7})");
+}
+
+TEST(ForkSession, PendingTextOverflowDropsOldestAndCounts) {
+  Fixture fx;
+  fx.session->Start();
+  constexpr std::size_t kOverflow = 6;
+  for (std::size_t i = 0; i < ForkSession::kMaxPendingTexts + kOverflow; ++i) {
+    EXPECT_TRUE(fx.session->SendText(R"({"n":)" + std::to_string(i) + "}"));
+  }
+  fx.net.RunPosted();
+  EXPECT_EQ(fx.session->stats().pending_texts_dropped, kOverflow);
+
+  fx.net.handler().OnConnected();
+  const auto& texts = fx.net.live().texts;
+  ASSERT_EQ(texts.size(), ForkSession::kMaxPendingTexts + 1);
+  EXPECT_EQ(texts[1], R"({"n":6})");
+  EXPECT_EQ(texts.back(), R"({"n":69})");
+}
+
+TEST(ForkSession, SendTextRefusedByTheSocketIsCountedAsADrop) {
+  Fixture fx;
+  fx.Connect();
+  fx.net.live().accept_sends = false;
+  EXPECT_TRUE(fx.session->SendText(R"({"n":1})"));
+  fx.net.RunPosted();
+
+  EXPECT_EQ(fx.session->stats().pending_texts_dropped, 1U);
+  EXPECT_EQ(fx.net.live().texts.size(), 1U);
+}
+
+TEST(ForkSession, SendTextAndSendDtmfRejectedOnceTeardownStarts) {
+  Fixture fx;
+  fx.Connect();
+  fx.StopAndRun();
+  ASSERT_EQ(fx.session->state(), SessionState::kClosing);
+  EXPECT_FALSE(fx.session->SendText(R"({"n":1})"));
+  EXPECT_FALSE(fx.session->SendDtmf('5', 160));
+  EXPECT_TRUE(fx.net.posted.empty());
+
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  ASSERT_EQ(fx.session->state(), SessionState::kDead);
+  EXPECT_FALSE(fx.session->SendText(R"({"n":2})"));
+  EXPECT_TRUE(fx.net.posted.empty());
+}
+
+TEST(ForkSession, TextStillQueuedAtFinalizeIsDiscardedAndCounted) {
+  Fixture fx;
+  fx.session->Start();
+  EXPECT_TRUE(fx.session->SendText(R"({"n":1})"));
+  EXPECT_TRUE(fx.session->SendText(R"({"n":2})"));
+  fx.net.RunPosted();
+  ASSERT_EQ(fx.session->stats().pending_texts_dropped, 0U);
+
+  fx.StopAndRun();
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  ASSERT_EQ(fx.session->state(), SessionState::kDead);
+  EXPECT_EQ(fx.session->stats().pending_texts_dropped, 2U);
+  EXPECT_TRUE(fx.net.live().texts.empty());
+}
+
+TEST(ForkSession, TextWhoseHopLandsAfterTeardownIsDropped) {
+  Fixture fx;
+  fx.Connect();
+  EXPECT_TRUE(fx.session->SendText(R"({"n":1})"));
+  ASSERT_EQ(fx.net.posted.size(), 1U);
+  auto deliver = std::move(fx.net.posted.front());
+  fx.net.posted.clear();
+
+  fx.StopAndRun();
+  ASSERT_EQ(fx.session->state(), SessionState::kClosing);
+  deliver();
+
+  EXPECT_EQ(fx.session->stats().pending_texts_dropped, 1U);
+  ASSERT_EQ(fx.net.live().texts.size(), 2U);
+  EXPECT_EQ(json::parse(fx.net.live().texts[1])["type"], "bye");
+}
+
+TEST(ForkSession, DtmfIsEncodedOnTheWire) {
+  Fixture fx;
+  fx.Connect();
+  EXPECT_TRUE(fx.session->SendDtmf('5', 160));
+  fx.net.RunPosted();
+
+  ASSERT_EQ(fx.net.live().texts.size(), 2U);
+  const json dtmf = json::parse(fx.net.live().texts[1]);
+  EXPECT_EQ(dtmf["type"], "dtmf");
+  EXPECT_EQ(dtmf["digit"], "5");
+  EXPECT_EQ(dtmf["durationMs"], 160);
+  EXPECT_EQ(dtmf.size(), 3U);
+}
+
+TEST(ForkSession, DtmfWithAnUnencodableDigitIsRejectedWithoutHopping) {
+  Fixture fx;
+  fx.Connect();
+  EXPECT_FALSE(fx.session->SendDtmf('E', 160));
+  EXPECT_TRUE(fx.net.posted.empty());
+  EXPECT_EQ(fx.net.live().texts.size(), 1U);
+}
+
+TEST(ForkSession, DtmfAndAppTextShareOneQueueInOrder) {
+  Fixture fx;
+  fx.session->Start();
+  EXPECT_TRUE(fx.session->SendText(R"({"n":1})"));
+  EXPECT_TRUE(fx.session->SendDtmf('7', 80));
+  EXPECT_TRUE(fx.session->SendText(R"({"n":2})"));
+  fx.net.RunPosted();
+  fx.net.handler().OnConnected();
+
+  const auto& texts = fx.net.live().texts;
+  ASSERT_EQ(texts.size(), 4U);
+  EXPECT_EQ(texts[1], R"({"n":1})");
+  EXPECT_EQ(json::parse(texts[2])["digit"], "7");
+  EXPECT_EQ(json::parse(texts[2])["durationMs"], 80);
+  EXPECT_EQ(texts[3], R"({"n":2})");
+}
+
 }  // namespace
 }  // namespace audiofork

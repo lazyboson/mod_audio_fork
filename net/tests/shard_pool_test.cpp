@@ -292,5 +292,39 @@ TEST(ShardPool, StopIsSafeFromAnotherThreadWhileAudioIsFlowing) {
   EXPECT_EQ(fx.slabs->stats().leased_slabs, 0U);
 }
 
+TEST(ShardPool, SendTextAndDtmfReachTheServerFromAnotherThread) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  PoolFixture fx(2);
+
+  auto session = fx.pool->StartFork(MakeParams(server->port(), "fork-text"), MakeTuning(),
+                                    fx.events, fx.clock);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kConnect) == 1U; }));
+
+  constexpr int kRounds = 25;
+  std::atomic<int> accepted{0};
+  std::thread control([&] {
+    for (int round = 0; round < kRounds; ++round) {
+      const std::string text = R"({"n":)" + std::to_string(round) + "}";
+      accepted.fetch_add(static_cast<int>(session->SendText(text)), std::memory_order_relaxed);
+      accepted.fetch_add(static_cast<int>(session->SendDtmf('1', 160)), std::memory_order_relaxed);
+    }
+  });
+  control.join();
+  EXPECT_EQ(accepted.load(std::memory_order_relaxed), 2 * kRounds);
+
+  // the server echoes every text frame back, so each one returns as a json
+  // event — as does the echo of our own hello
+  ASSERT_TRUE(WaitUntil([&] {
+    return fx.events.Count(ForkEventType::kJson) >= static_cast<std::size_t>(2 * kRounds) + 1U;
+  }));
+  EXPECT_EQ(session->stats().pending_texts_dropped, 0U);
+
+  session->Stop();
+  ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kDead; }));
+  EXPECT_EQ(fx.slabs->stats().leased_slabs, 0U);
+}
+
 }  // namespace
 }  // namespace audiofork::net

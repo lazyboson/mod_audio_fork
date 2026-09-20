@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -26,7 +27,7 @@ namespace audiofork {
 //
 // Thread contract (DESIGN.md §3):
 //   PushAudio  — media thread only; lock-free, allocation-free, never blocks.
-//   Stop       — any thread; hops to the shard via NetPort::Post.
+//   Stop, SendText, SendDtmf — any thread; hop to the shard via NetPort::Post.
 //   everything else — shard thread only.
 //
 // Lifetime (DESIGN.md §4): two strong refs, one per owner (media bug, shard
@@ -61,7 +62,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::uint64_t playback_underruns = 0;
     std::uint64_t barge_ins = 0;
     std::size_t playback_buffered_bytes = 0;
+    std::uint64_t pending_texts_dropped = 0;
   };
+
+  static constexpr std::size_t kMaxPendingTexts = 64;
 
   [[nodiscard]] static std::shared_ptr<ForkSession> Create(ForkParams params, Tuning tuning,
                                                            NetPort& net, EventSink& events,
@@ -73,6 +77,11 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void Start();
   void Pump();
   void Stop();
+  // False means the text was refused outright (teardown started, or a digit the
+  // wire protocol has no encoding for); true only means it was handed to the
+  // shard, which may still drop it if the queue overflows or the socket refuses.
+  [[nodiscard]] bool SendText(std::string text);
+  [[nodiscard]] bool SendDtmf(char digit, std::uint32_t duration_ms);
   void set_on_finished(std::function<void()> callback) { on_finished_ = std::move(callback); }
 
   [[nodiscard]] bool PushAudio(ConstByteSpan pcm) noexcept;
@@ -102,6 +111,9 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void ScheduleRetry();
   void DrainHandoffRing();
   void FlushToConnection();
+  void DeliverText(std::string text);
+  void QueueText(std::string text);
+  void FlushPendingTexts();
   void PumpPlayback();
   void HandlePlaybackStart(std::uint32_t sample_rate, std::uint8_t channels);
   void HandleClear();
@@ -134,6 +146,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   NetConnection* connection_ = nullptr;
   std::function<void()> on_finished_;
 
+  // app text and DTMF that arrived before the socket was usable; flushed after
+  // hello (and resume) so the server never sees them ahead of the handshake
+  std::deque<std::string> pending_texts_;
+
   bool reconnecting_ = false;
   bool dropping_ = false;
   bool bye_sent_ = false;
@@ -155,6 +171,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   std::atomic<std::uint64_t> playback_underruns_{0};
   std::atomic<std::uint64_t> barge_ins_{0};
   std::atomic<std::size_t> playback_buffered_bytes_{0};
+  std::atomic<std::uint64_t> pending_texts_dropped_{0};
 };
 
 }  // namespace audiofork

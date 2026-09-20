@@ -15,9 +15,10 @@ Target: ~1,000 concurrent calls per box.
 
 ## Status
 
-Design phase complete; no code yet. Next milestone is M1 (DESIGN.md §12):
-`core/` library — session state machine, SPSC ring, slab pool — with full
-unit/TSan/interleaving test suites and zero FreeSWITCH dependencies.
+M1–M4 (DESIGN.md §12) are implemented and covered by unit, interleaving, and
+sanitizer suites: core state machine, lws shim, module shell, fork path,
+playback, `send_text` passthrough, DTMF forwarding. Nothing has run on a live
+call yet — live-call and `rig/` load verification are M5.
 
 ## Layout contract
 
@@ -33,5 +34,10 @@ unit/TSan/interleaving test suites and zero FreeSWITCH dependencies.
 - Run ASan/UBSan on the suite before calling work done; TSan additionally
   for anything touching threads or atomics.
 - Comment policy is the `comment-style` skill; default is zero comments.
-- Build/test commands: to be added when M1 lands the build system — update
-  this section in that PR.
+- Build/test commands (all from the repo root):
+  - `cmake --preset asan && cmake --build --preset asan --parallel && ctest --preset asan`
+  - the same three with `tsan` (the preset supplies `tsan.supp`)
+  - format: `git ls-files '*.hpp' '*.cpp' | xargs clang-format --dry-run --Werror`
+  - tidy: `cmake --preset debug && run-clang-tidy -p build/debug -quiet 'core/(src|tests)/.*\.cpp'`
+  - fuzz: `CC=clang CXX=clang++ cmake --preset fuzz && cmake --build --preset fuzz --parallel --target protocol_fuzz && ./build/fuzz/core/tests/protocol_fuzz -runs=200000 -max_len=4096 -timeout=10 /tmp/fuzz-scratch core/tests/fuzz/corpus`
+  - module against real FreeSWITCH headers: `docker build --target build .`
