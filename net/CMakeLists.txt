@@ -1,7 +1,10 @@
 include(FetchContent)
 
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-set(LWS_WITH_SSL OFF CACHE BOOL "" FORCE)
+set(LWS_WITH_SSL ON CACHE BOOL "" FORCE)
+set(LWS_WITH_OPENSSL ON CACHE BOOL "" FORCE)
+set(LWS_WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
+set(LWS_SSL_CLIENT_USE_OS_CA_CERTS ON CACHE BOOL "" FORCE)
 set(LWS_WITH_SHARED OFF CACHE BOOL "" FORCE)
 set(LWS_WITH_STATIC ON CACHE BOOL "" FORCE)
 set(LWS_WITHOUT_TESTAPPS ON CACHE BOOL "" FORCE)
@@ -35,7 +38,7 @@ target_include_directories(audiofork_net SYSTEM PRIVATE
 )
 target_link_libraries(audiofork_net
   PUBLIC audiofork_core
-  PRIVATE websockets audiofork_warnings
+  PRIVATE websockets OpenSSL::SSL OpenSSL::Crypto audiofork_warnings
 )
 
 if(BUILD_TESTING)
