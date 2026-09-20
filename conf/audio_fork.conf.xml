@@ -16,6 +16,9 @@
          stalled forks degrade rather than letting FreeSWITCH be OOM-killed -->
     <param name="global-memory-cap-mb" value="1536"/>
 
+    <!-- what a fork keeps buffered once the global cap is hit -->
+    <param name="emergency-buffer-seconds" value="2"/>
+
     <!-- playback (server -> caller): above the high watermark the module stops
          reading the socket so the server's audio waits in TCP rather than in
          our memory; reading resumes below the low watermark -->

@@ -87,6 +87,8 @@ class ShardPool {
                                                        EventSink& events, Clock& clock);
   [[nodiscard]] std::size_t shard_count() const { return shards_.size(); }
   [[nodiscard]] std::size_t active_forks() const;
+  // Per-shard fork counts in shard order, for the status command's load view.
+  [[nodiscard]] std::vector<std::size_t> shard_loads() const;
   [[nodiscard]] SlabPool& pool() { return pool_; }
 
   explicit ShardPool(SlabPool pool) : pool_(std::move(pool)) {}
