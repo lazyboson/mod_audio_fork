@@ -40,6 +40,35 @@ On musl builds of FreeSWITCH (Alpine), also set
 without it FreeSWITCH 1.10.12 SIGSEGVs at shutdown once any session has carried
 a playback media bug (DESIGN.md §13).
 
+## Packaging
+
+`docker build .` produces a two-stage image: an Alpine builder carrying the
+FreeSWITCH headers and toolchain, and a runtime stage carrying an Alpine
+FreeSWITCH plus `mod_audio_fork.so` in `/usr/lib/freeswitch/mod/` and
+`audio_fork.conf.xml` in `/etc/freeswitch/autoload_configs/`. Nothing else
+ships.
+
+libwebsockets is vendored and statically linked, and carries one local patch —
+[`net/patch_lws_client_http.cmake`](net/patch_lws_client_http.cmake), a
+use-after-free reachable when the HTTP upgrade request fails to write.
+nlohmann/json is header-only and compiled in. Neither is visible to a
+package-database scanner, so the image build writes a CycloneDX 1.5 SBOM
+naming both to `/usr/share/doc/mod_audio_fork/sbom.cdx.json`; their versions
+are read back out of the CMake pins, so the SBOM cannot drift from what was
+built. OpenSSL is not bundled — the module links `libssl`/`libcrypto`
+dynamically and shares the copy FreeSWITCH already loaded, and the SBOM names
+the image's package version for it. The `.so` exports exactly one symbol,
+`mod_audio_fork_module_interface`.
+
+```sh
+docker run --rm <image> cat /usr/share/doc/mod_audio_fork/sbom.cdx.json
+```
+
+| Build ARG | Default | Meaning |
+|---|---|---|
+| `AUDIOFORK_VERSION` | `0.0.0-dev` | Names the build in the SBOM and in `org.opencontainers.image.version`. Pass `$(git describe --tags --always)`. |
+| `AUDIOFORK_STRIP` | `1` | `0` builds RelWithDebInfo and skips the strip, so a crash in a rig container has a symbolised backtrace. |
+
 ## Using it
 
 ```

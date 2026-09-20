@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "DESIGN.md §13: routine pin bumps batch monthly into one PR.",
+      "matchPackageNames": ["*"],
+      "groupName": "dependency pins",
+      "schedule": ["before 6am on the first day of the month"]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "description": "DESIGN.md §13: security-labelled bumps skip the batch and merge within 48h.",
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"],
+    "groupName": null,
+    "minimumReleaseAge": null
+  },
+  "customManagers": [
+    {
+      "description": "FetchContent pins (libwebsockets, nlohmann/json, GoogleTest). Renovate rewrites the URL but not the URL_HASH beside it, so the PR author must recompute the SHA256; until they do, the CMake download fails the hash check and CI stays red.",
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)CMakeLists\\.txt$/"],
+      "matchStrings": [
+        "URL https://github\\.com/(?<depName>[^/\\s]+/[^/\\s]+)/archive/refs/tags/(?<currentValue>v[^/\\s]+)\\.tar\\.",
+        "URL https://github\\.com/(?<depName>[^/\\s]+/[^/\\s]+)/releases/download/(?<currentValue>v[^/\\s]+)/"
+      ],
+      "datasourceTemplate": "github-tags",
+      "versioningTemplate": "semver"
+    }
+  ]
+}

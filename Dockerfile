@@ -35,9 +35,21 @@ RUN echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repo
 COPY --from=build /build/module/mod_audio_fork.so /usr/lib/freeswitch/mod/mod_audio_fork.so
 COPY conf/audio_fork.conf.xml /etc/freeswitch/autoload_configs/audio_fork.conf.xml
 
-# SBOM placeholder: the statically linked lws and nlohmann/json versions are
-# invisible to package scanners (DESIGN.md §13), so CI must emit an SBOM here.
+# git describe --tags --always of the source tree; the SBOM has no other way to
+# name this build.
+ARG AUDIOFORK_VERSION=0.0.0-dev
+
+# The SBOM is generated here and not in the build stage because the OpenSSL
+# package version is a property of this image; the vendored pins are read from
+# the CMake files the build stage actually compiled.
+COPY packaging/sbom.sh /tmp/sbom.sh
+COPY --from=build /src/net/CMakeLists.txt /tmp/pins/net/CMakeLists.txt
+COPY --from=build /src/core/CMakeLists.txt /tmp/pins/core/CMakeLists.txt
+RUN mkdir -p /usr/share/doc/mod_audio_fork && \
+    AUDIOFORK_VERSION="$AUDIOFORK_VERSION" sh /tmp/sbom.sh /tmp/pins \
+      > /usr/share/doc/mod_audio_fork/sbom.cdx.json && \
+    rm -rf /tmp/sbom.sh /tmp/pins
+
 LABEL org.opencontainers.image.title="mod_audio_fork" \
       org.opencontainers.image.description="Bidirectional FreeSWITCH audio fork over WebSockets" \
-      audiofork.vendored.libwebsockets="4.3.3" \
-      audiofork.vendored.nlohmann_json="3.11.3"
+      org.opencontainers.image.version="$AUDIOFORK_VERSION"
