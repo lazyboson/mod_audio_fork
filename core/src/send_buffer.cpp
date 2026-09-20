@@ -8,12 +8,12 @@ namespace audiofork {
 SendBuffer::SendBuffer(SlabPool pool, std::size_t cap_bytes)
     : queue_(std::move(pool)), cap_bytes_(cap_bytes) {}
 
-std::size_t SendBuffer::Append(ConstByteSpan bytes) {
+SendBuffer::AppendResult SendBuffer::Append(ConstByteSpan bytes) {
   if (bytes.empty() || cap_bytes_ == 0) {
-    return bytes.size();
+    return {bytes.size(), false};
   }
 
-  std::size_t dropped = 0;
+  AppendResult result;
   // A frame larger than the whole cap keeps only its tail: the newest audio.
   const std::uint8_t* read = bytes.begin();
   std::size_t remaining = bytes.size();
@@ -21,10 +21,10 @@ std::size_t SendBuffer::Append(ConstByteSpan bytes) {
     const std::size_t skip = remaining - cap_bytes_;
     read += skip;
     remaining -= skip;
-    dropped += skip;
+    result.dropped_bytes += skip;
   }
   if (queue_.size() + remaining > cap_bytes_) {
-    dropped += DropOldest(queue_.size() + remaining - cap_bytes_);
+    result.dropped_bytes += DropOldest(queue_.size() + remaining - cap_bytes_);
   }
 
   while (remaining > 0) {
@@ -35,13 +35,15 @@ std::size_t SendBuffer::Append(ConstByteSpan bytes) {
       break;
     }
     // pool exhausted: same policy as a full buffer, drop oldest and retry
+    result.pool_exhausted = true;
     const std::size_t reclaimed = DropOldest(remaining);
-    dropped += reclaimed;
+    result.dropped_bytes += reclaimed;
     if (reclaimed == 0) {
-      return dropped + remaining;
+      result.dropped_bytes += remaining;
+      return result;
     }
   }
-  return dropped;
+  return result;
 }
 
 std::size_t SendBuffer::SetCap(std::size_t cap_bytes) {

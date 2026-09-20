@@ -137,12 +137,16 @@ struct Fixture {
   FakeNet net;
   RecordingEvents events;
   FakeClock clock;
-  std::optional<SlabPool> pool = SlabPool::Create({4096, std::size_t{4096} * 512});
+  std::optional<SlabPool> pool;
   std::shared_ptr<ForkSession> session;
   bool finished = false;
 
   explicit Fixture(std::chrono::milliseconds send_buffer = milliseconds{1000},
-                   std::chrono::milliseconds handoff = milliseconds{500}) {
+                   std::chrono::milliseconds handoff = milliseconds{500},
+                   std::chrono::milliseconds emergency = milliseconds{0},
+                   std::optional<SlabPool> shared_pool = std::nullopt) {
+    pool =
+        shared_pool.has_value() ? shared_pool : SlabPool::Create({4096, std::size_t{4096} * 512});
     ForkParams params;
     params.call_uuid = "call-1";
     params.fork_id = "fork-1";
@@ -155,6 +159,7 @@ struct Fixture {
     tuning.send_cap_bytes = format.BytesForDuration(send_buffer);
     tuning.handoff_bytes = format.BytesForDuration(handoff);
     tuning.coalesce_max_bytes = format.BytesForDuration(milliseconds{100});
+    tuning.emergency_cap_bytes = format.BytesForDuration(emergency);
     tuning.drain_timeout = milliseconds{2000};
     tuning.backoff = {milliseconds{250}, milliseconds{5000}, 2.0, 0.0};
 
@@ -254,6 +259,103 @@ TEST(ForkSession, StalledPeerDropsOldestAndEmitsOneOverrunPerEpisode) {
     fx.session->Pump();
   }
   EXPECT_EQ(fx.events.Count(ForkEventType::kOverrun), 2U);
+}
+
+TEST(ForkSession, OwnCapOverflowDropsWithoutDegrading) {
+  Fixture fx(milliseconds{200}, milliseconds{500}, milliseconds{100});
+  fx.Connect();
+  fx.net.live().accept_sends = false;
+
+  const auto pcm = Frame(kBytesPerSecond / 10);
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(pcm)));
+    fx.session->Pump();
+  }
+  EXPECT_GT(fx.session->stats().buffer_dropped_bytes, 0U);
+  EXPECT_FALSE(fx.session->stats().degraded);
+  EXPECT_EQ(fx.events.Count(ForkEventType::kDegraded), 0U);
+}
+
+TEST(ForkSession, PoolExhaustionDegradesTheStarvedForkOnceThenRecovers) {
+  auto shared = SlabPool::Create({4096, std::size_t{4096} * 12});
+  ASSERT_TRUE(shared.has_value());
+  Fixture hog(milliseconds{1000}, milliseconds{500}, milliseconds{0}, shared);
+  Fixture starved(milliseconds{1000}, milliseconds{500}, milliseconds{200}, shared);
+  hog.Connect();
+  starved.Connect();
+  hog.net.live().accept_sends = false;
+  starved.net.live().accept_sends = false;
+
+  const auto pcm = Frame(kBytesPerSecond / 10);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_TRUE(hog.session->PushAudio(ConstByteSpan(pcm)));
+    hog.session->Pump();
+  }
+  // whatever the hog left over goes too, so the pool is dry to the byte
+  std::vector<SlabLease> held;
+  for (auto lease = shared->Acquire(); lease.has_value(); lease = shared->Acquire()) {
+    held.push_back(*std::move(lease));
+  }
+  ASSERT_FALSE(shared->CanLease(1));
+  // the hog has no emergency cap configured, so it drops but never degrades
+  EXPECT_EQ(hog.events.Count(ForkEventType::kDegraded), 0U);
+  EXPECT_FALSE(hog.session->stats().degraded);
+
+  EXPECT_TRUE(starved.session->PushAudio(ConstByteSpan(pcm)));
+  starved.session->Pump();
+  EXPECT_TRUE(starved.session->stats().degraded);
+  EXPECT_EQ(starved.events.Count(ForkEventType::kDegraded), 1U);
+  EXPECT_EQ(starved.session->stats().buffer_dropped_bytes, pcm.size());
+
+  // an empty buffer while the pool is still dry is not recovery: no flapping
+  // back to the full cap, and no second event
+  EXPECT_TRUE(starved.session->PushAudio(ConstByteSpan(pcm)));
+  starved.session->Pump();
+  EXPECT_TRUE(starved.session->stats().degraded);
+  EXPECT_EQ(starved.events.Count(ForkEventType::kDegraded), 1U);
+  EXPECT_EQ(starved.session->stats().buffer_dropped_bytes, pcm.size() * 2);
+
+  held.clear();
+  hog.net.live().accept_sends = true;
+  for (int i = 0; i < 20; ++i) {
+    hog.session->Pump();
+  }
+  ASSERT_EQ(hog.session->stats().buffered_bytes, 0U);
+
+  // buffering again, but only to the emergency cap
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(starved.session->PushAudio(ConstByteSpan(pcm)));
+    starved.session->Pump();
+  }
+  EXPECT_EQ(starved.session->stats().buffered_bytes, kBytesPerSecond / 5);
+  EXPECT_TRUE(starved.session->stats().degraded);
+
+  starved.net.live().accept_sends = true;
+  for (int i = 0; i < 20; ++i) {
+    starved.session->Pump();
+  }
+  EXPECT_EQ(starved.session->stats().buffered_bytes, 0U);
+  EXPECT_FALSE(starved.session->stats().degraded);
+  // recovery is silent: one event for the whole episode
+  EXPECT_EQ(starved.events.Count(ForkEventType::kDegraded), 1U);
+
+  starved.net.live().accept_sends = false;
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(starved.session->PushAudio(ConstByteSpan(pcm)));
+    starved.session->Pump();
+  }
+  EXPECT_EQ(starved.session->stats().buffered_bytes, pcm.size() * 4);
+}
+
+TEST(ForkSession, MinimumSlabsHoldsOneCoalescedMessagePlusOne) {
+  ForkSession::Tuning tuning;
+  tuning.coalesce_max_bytes = 6400;
+  EXPECT_EQ(ForkSession::MinimumSlabs(tuning, 4096), 3U);
+  tuning.coalesce_max_bytes = 4096;
+  EXPECT_EQ(ForkSession::MinimumSlabs(tuning, 4096), 2U);
+  tuning.coalesce_max_bytes = 1;
+  EXPECT_EQ(ForkSession::MinimumSlabs(tuning, 4096), 2U);
+  EXPECT_EQ(ForkSession::MinimumSlabs(tuning, 0), 0U);
 }
 
 TEST(ForkSession, BufferedAudioSurvivesDisconnectAndResumeReportsGap) {

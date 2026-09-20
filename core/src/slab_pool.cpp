@@ -79,10 +79,17 @@ std::optional<SlabLease> SlabPool::Acquire() {
   return SlabLease(state_, std::move(storage));
 }
 
+bool SlabPool::CanLease(std::size_t slabs) const {
+  const std::scoped_lock lock(state_->mutex);
+  const std::size_t growable =
+      (state_->options.max_total_bytes - state_->allocated_bytes) / state_->options.slab_size_bytes;
+  return state_->free_slabs.size() + growable >= slabs;
+}
+
 SlabPool::Stats SlabPool::stats() const {
   const std::scoped_lock lock(state_->mutex);
   return Stats{state_->options.slab_size_bytes, state_->allocated_bytes, state_->leased_slabs,
-               state_->free_slabs.size()};
+               state_->free_slabs.size(), state_->options.max_total_bytes};
 }
 
 }  // namespace audiofork

@@ -41,6 +41,8 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::size_t send_cap_bytes = 0;
     std::size_t handoff_bytes = 0;
     std::size_t coalesce_max_bytes = 0;
+    // zero disables degradation: the send cap never shrinks (DESIGN.md §5)
+    std::size_t emergency_cap_bytes = 0;
     std::chrono::milliseconds drain_timeout{2000};
     ReconnectBackoff::Options backoff;
     std::uint64_t backoff_seed = 0;
@@ -63,9 +65,16 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::uint64_t barge_ins = 0;
     std::size_t playback_buffered_bytes = 0;
     std::uint64_t pending_texts_dropped = 0;
+    std::uint64_t playback_bytes_dropped = 0;
+    bool degraded = false;
   };
 
   static constexpr std::size_t kMaxPendingTexts = 64;
+
+  // A fork that cannot hold one coalesced message plus a slab for playback has
+  // no working set: it could only drop. The module refuses to start one rather
+  // than let the global cap produce forks that are born broken (DESIGN.md §5).
+  [[nodiscard]] static std::size_t MinimumSlabs(const Tuning& tuning, std::size_t slab_bytes);
 
   [[nodiscard]] static std::shared_ptr<ForkSession> Create(ForkParams params, Tuning tuning,
                                                            NetPort& net, EventSink& events,
@@ -120,6 +129,9 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void HandleMark(std::string name);
   void Emit(ForkEventType type, std::string detail = {});
   void EmitOverrunIfNewEpisode(std::size_t dropped);
+  // Returns the bytes the shrunken cap shed, 0 when already degraded.
+  [[nodiscard]] std::size_t DegradeIfNewEpisode();
+  void RestoreCapIfDrained();
   [[nodiscard]] std::uint64_t BytesToMs(std::uint64_t bytes) const;
 
   ForkParams params_;
@@ -152,6 +164,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
 
   bool reconnecting_ = false;
   bool dropping_ = false;
+  bool pool_starved_ = false;
   bool bye_sent_ = false;
   std::optional<std::chrono::steady_clock::time_point> disconnected_at_;
   std::optional<std::chrono::steady_clock::time_point> drain_deadline_;
@@ -172,6 +185,8 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   std::atomic<std::uint64_t> barge_ins_{0};
   std::atomic<std::size_t> playback_buffered_bytes_{0};
   std::atomic<std::uint64_t> pending_texts_dropped_{0};
+  std::atomic<std::uint64_t> playback_bytes_dropped_{0};
+  std::atomic<bool> degraded_{false};
 };
 
 }  // namespace audiofork

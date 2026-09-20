@@ -135,6 +135,7 @@ void ForkSession::Pump() {
   PumpPlayback();
   if (state_.state() == SessionState::kActive) {
     FlushToConnection();
+    RestoreCapIfDrained();
     return;
   }
   if (state_.state() != SessionState::kDraining) {
@@ -211,7 +212,10 @@ void ForkSession::OnBinary(ConstByteSpan bytes) {
   }
   playback_bytes_received_.fetch_add(bytes.size(), std::memory_order_relaxed);
   const std::size_t refused = playback_->Append(bytes);
+  // audio refused while muted was discarded on purpose by a barge-in, so only
+  // the rest is a loss worth counting
   if (refused > 0 && !playback_->muted()) {
+    playback_bytes_dropped_.fetch_add(refused, std::memory_order_relaxed);
     Emit(ForkEventType::kError, "playback buffer overflowed, audio discarded");
   }
   if (!playback_started_ && !playback_->empty()) {
@@ -365,12 +369,18 @@ void ForkSession::DrainHandoffRing() {
     if (count == 0) {
       return;
     }
-    const std::size_t dropped = buffer_.Append(ConstByteSpan(scratch.data(), count));
+    const SendBuffer::AppendResult result = buffer_.Append(ConstByteSpan(scratch.data(), count));
+    pool_starved_ = result.pool_exhausted;
+    if (result.pool_exhausted) {
+      const std::size_t shed = DegradeIfNewEpisode();
+      buffer_dropped_bytes_.fetch_add(shed, std::memory_order_relaxed);
+      dropped_since_resume_ += shed;
+    }
     buffered_bytes_.store(buffer_.size(), std::memory_order_relaxed);
-    if (dropped > 0) {
-      buffer_dropped_bytes_.fetch_add(dropped, std::memory_order_relaxed);
-      dropped_since_resume_ += dropped;
-      EmitOverrunIfNewEpisode(dropped);
+    if (result.dropped_bytes > 0) {
+      buffer_dropped_bytes_.fetch_add(result.dropped_bytes, std::memory_order_relaxed);
+      dropped_since_resume_ += result.dropped_bytes;
+      EmitOverrunIfNewEpisode(result.dropped_bytes);
     } else {
       dropping_ = false;
     }
@@ -460,6 +470,27 @@ void ForkSession::EmitOverrunIfNewEpisode(std::size_t dropped) {
   events_.Emit(event);
 }
 
+std::size_t ForkSession::DegradeIfNewEpisode() {
+  if (tuning_.emergency_cap_bytes == 0 || degraded_.load(std::memory_order_relaxed)) {
+    return 0;
+  }
+  degraded_.store(true, std::memory_order_relaxed);
+  const std::size_t shed = buffer_.SetCap(tuning_.emergency_cap_bytes);
+  Emit(ForkEventType::kDegraded, "global memory cap reached, send buffer cut to the emergency cap");
+  return shed;
+}
+
+void ForkSession::RestoreCapIfDrained() {
+  // An empty buffer is recovery only once the pool feeds this fork again:
+  // while the pool is dry every frame is dropped, so emptiness alone would
+  // restore the full cap once per tick and re-emit `degraded` each time.
+  if (!degraded_.load(std::memory_order_relaxed) || pool_starved_ || !buffer_.empty()) {
+    return;
+  }
+  (void)buffer_.SetCap(tuning_.send_cap_bytes);
+  degraded_.store(false, std::memory_order_relaxed);
+}
+
 void ForkSession::PumpPlayback() {
   if (!playback_.has_value()) {
     return;
@@ -544,7 +575,16 @@ ForkSession::Stats ForkSession::stats() const {
                playback_underruns_.load(std::memory_order_relaxed),
                barge_ins_.load(std::memory_order_relaxed),
                playback_buffered_bytes_.load(std::memory_order_relaxed),
-               pending_texts_dropped_.load(std::memory_order_relaxed)};
+               pending_texts_dropped_.load(std::memory_order_relaxed),
+               playback_bytes_dropped_.load(std::memory_order_relaxed),
+               degraded_.load(std::memory_order_relaxed)};
+}
+
+std::size_t ForkSession::MinimumSlabs(const Tuning& tuning, std::size_t slab_bytes) {
+  if (slab_bytes == 0) {
+    return 0;
+  }
+  return (tuning.coalesce_max_bytes + slab_bytes - 1) / slab_bytes + 1;
 }
 
 }  // namespace audiofork

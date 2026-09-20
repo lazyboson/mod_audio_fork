@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -54,6 +55,8 @@ const char* EventName(ForkEventType type) {
       return "connect";
     case ForkEventType::kConnectFailed:
       return "connect_failed";
+    case ForkEventType::kStartFailed:
+      return "start_failed";
     case ForkEventType::kReconnecting:
       return "reconnecting";
     case ForkEventType::kResume:
@@ -135,6 +138,7 @@ struct ModuleState {
 
   std::mutex registry_mutex;
   std::unordered_map<std::string, std::vector<std::shared_ptr<ForkSession>>> registry;
+  std::atomic<std::uint64_t> start_failed{0};
 };
 
 ModuleState* g_state = nullptr;
@@ -165,6 +169,8 @@ ModuleConfig LoadConfig() {
         config.playback_low_watermark = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "coalesce-max-ms")) {
         config.coalesce_max = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "emergency-buffer-seconds")) {
+        config.emergency_buffer = std::chrono::milliseconds{number * 1000};
       } else if (!strcasecmp(name, "global-memory-cap-mb")) {
         config.global_memory_cap_bytes =
             static_cast<std::size_t>(std::max(number, 1)) * 1024 * 1024;
@@ -236,6 +242,7 @@ ForkSession::Tuning MakeTuning(const ModuleConfig& config, const AudioFormat& fo
   tuning.send_cap_bytes = format.BytesForDuration(config.send_buffer);
   tuning.handoff_bytes = format.BytesForDuration(config.handoff_buffer);
   tuning.coalesce_max_bytes = format.BytesForDuration(config.coalesce_max);
+  tuning.emergency_cap_bytes = format.BytesForDuration(config.emergency_buffer);
   tuning.drain_timeout = config.drain_timeout;
   tuning.backoff = {config.reconnect_min, config.reconnect_max, 2.0, 0.25};
   // playback is sized in mono at the fork rate: the server sends one stream for
@@ -426,6 +433,16 @@ switch_status_t OnRecvDtmf(switch_core_session_t* session, const switch_dtmf_t* 
   return SWITCH_STATUS_SUCCESS;
 }
 
+// fork_id stays empty: the fork never got far enough to have one.
+void EmitStartFailed(const std::string& uuid, const std::string& reason) {
+  g_state->start_failed.fetch_add(1, std::memory_order_relaxed);
+  ForkEvent event;
+  event.type = ForkEventType::kStartFailed;
+  event.call_uuid = uuid;
+  event.detail = reason;
+  g_state->events.Emit(event);
+}
+
 switch_status_t StartFork(switch_core_session_t* session, const char* url, const char* mix_text,
                           const char* rate_text, const char* metadata, std::string& error) {
   switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -465,10 +482,18 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
   params.mix_type = mix;
   params.metadata_json = metadata == nullptr ? "" : metadata;
 
-  auto fork = g_state->shards->StartFork(params, MakeTuning(g_state->config, wire_format),
-                                         g_state->events, g_state->clock);
+  const ForkSession::Tuning tuning = MakeTuning(g_state->config, wire_format);
+  if (!g_state->pool->CanLease(
+          ForkSession::MinimumSlabs(tuning, g_state->pool->stats().slab_size_bytes))) {
+    error = "global memory cap reached";
+    EmitStartFailed(uuid, error);
+    return SWITCH_STATUS_FALSE;
+  }
+
+  auto fork = g_state->shards->StartFork(params, tuning, g_state->events, g_state->clock);
   if (fork == nullptr) {
     error = "fork could not be created";
+    EmitStartFailed(uuid, error);
     return SWITCH_STATUS_FALSE;
   }
   fork->set_on_finished([uuid, weak = std::weak_ptr<ForkSession>(fork)] {
