@@ -25,6 +25,9 @@ set(LWS_MAX_SMP 8 CACHE STRING "" FORCE)
 FetchContent_Declare(libwebsockets
   URL https://github.com/warmcat/libwebsockets/archive/refs/tags/v4.3.3.tar.gz
   URL_HASH SHA256=6fd33527b410a37ebc91bb64ca51bdabab12b076bc99d153d7c5dd405e4bdf90
+  PATCH_COMMAND ${CMAKE_COMMAND}
+    -DLWS_SOURCE_DIR=<SOURCE_DIR>
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_lws_client_http.cmake
 )
 FetchContent_MakeAvailable(libwebsockets)
 
