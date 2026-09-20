@@ -261,6 +261,53 @@ TEST(ForkSession, StalledPeerDropsOldestAndEmitsOneOverrunPerEpisode) {
   EXPECT_EQ(fx.events.Count(ForkEventType::kOverrun), 2U);
 }
 
+TEST(ForkSession, PausedAudioIsDiscardedWithoutCountingAsAMediaDrop) {
+  Fixture fx;
+  fx.Connect();
+  const auto before = Frame(640, 1);
+  EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(before)));
+  fx.session->Pump();
+
+  fx.session->SetPaused(true);
+  const auto muted = Frame(640, 2);
+  // a paused push is accepted, not refused: the media bug has nothing to retry
+  EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(muted)));
+  fx.session->Pump();
+  EXPECT_EQ(fx.net.live().binary, before);
+  EXPECT_EQ(fx.session->stats().paused_bytes, muted.size());
+  EXPECT_EQ(fx.session->stats().media_dropped_bytes, 0U);
+  EXPECT_TRUE(fx.session->stats().paused);
+
+  // pausing twice is not a second state change
+  fx.session->SetPaused(true);
+  EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(muted)));
+  fx.session->Pump();
+  EXPECT_EQ(fx.session->stats().paused_bytes, muted.size() * 2);
+
+  fx.session->SetPaused(false);
+  const auto after = Frame(640, 3);
+  EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(after)));
+  fx.session->Pump();
+  EXPECT_FALSE(fx.session->stats().paused);
+  EXPECT_EQ(fx.session->stats().paused_bytes, muted.size() * 2);
+
+  std::vector<std::uint8_t> expected = before;
+  expected.insert(expected.end(), after.begin(), after.end());
+  EXPECT_EQ(fx.net.live().binary, expected);
+  EXPECT_EQ(fx.session->stats().sent_bytes, expected.size());
+}
+
+TEST(ForkSession, PauseDoesNotTouchTheSocketOrPlayback) {
+  Fixture fx;
+  fx.Connect();
+  const std::size_t texts_before = fx.net.live().texts.size();
+  fx.session->SetPaused(true);
+  fx.session->Pump();
+  EXPECT_EQ(fx.net.live().texts.size(), texts_before);
+  EXPECT_FALSE(fx.net.live().closed);
+  EXPECT_EQ(fx.session->state(), SessionState::kActive);
+}
+
 TEST(ForkSession, OwnCapOverflowDropsWithoutDegrading) {
   Fixture fx(milliseconds{200}, milliseconds{500}, milliseconds{100});
   fx.Connect();

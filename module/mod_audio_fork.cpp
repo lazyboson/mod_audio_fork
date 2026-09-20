@@ -400,6 +400,12 @@ void ForgetFork(const std::string& uuid, const std::shared_ptr<ForkSession>& ses
   }
 }
 
+std::vector<std::shared_ptr<ForkSession>> ForksFor(const std::string& uuid) {
+  const std::scoped_lock lock(g_state->registry_mutex);
+  const auto it = g_state->registry.find(uuid);
+  return it == g_state->registry.end() ? std::vector<std::shared_ptr<ForkSession>>{} : it->second;
+}
+
 // Runs on a FreeSWITCH session thread: SendDtmf hops to the shard, so nothing
 // here touches lws. The hook outlives the forks it was installed for —
 // FreeSWITCH only drops it when it destroys the session — so an empty registry
@@ -411,15 +417,8 @@ switch_status_t OnRecvDtmf(switch_core_session_t* session, const switch_dtmf_t* 
     return SWITCH_STATUS_SUCCESS;
   }
   try {
-    std::vector<std::shared_ptr<ForkSession>> forks;
-    {
-      const std::scoped_lock lock(g_state->registry_mutex);
-      const auto it = g_state->registry.find(switch_core_session_get_uuid(session));
-      if (it == g_state->registry.end()) {
-        return SWITCH_STATUS_SUCCESS;
-      }
-      forks = it->second;
-    }
+    const std::vector<std::shared_ptr<ForkSession>> forks =
+        ForksFor(switch_core_session_get_uuid(session));
     // FreeSWITCH counts DTMF duration in samples on a fixed 8kHz clock
     // (SWITCH_DEFAULT_DTMF_DURATION = 2000 samples = 250ms)
     const std::uint32_t duration_ms = dtmf->duration / 8;
@@ -557,14 +556,8 @@ switch_status_t StopForks(switch_core_session_t* session) {
   switch_channel_t* channel = switch_core_session_get_channel(session);
   const std::string uuid = switch_core_session_get_uuid(session);
 
-  std::vector<std::shared_ptr<ForkSession>> forks;
-  {
-    const std::scoped_lock lock(g_state->registry_mutex);
-    if (const auto it = g_state->registry.find(uuid); it != g_state->registry.end()) {
-      forks = it->second;
-    }
-  }
-  for (auto& fork : forks) {
+  const std::vector<std::shared_ptr<ForkSession>> forks = ForksFor(uuid);
+  for (const auto& fork : forks) {
     fork->Stop();
   }
   if (auto* bug =
@@ -580,6 +573,19 @@ switch_status_t StopForks(switch_core_session_t* session) {
   // forks that already retired on their own still leave the channel to clean
   // up, but there was nothing here to stop
   return forks.empty() ? SWITCH_STATUS_FALSE : SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t SetForksPaused(switch_core_session_t* session, bool paused, std::string& error) {
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
+  }
+  for (const auto& fork : forks) {
+    fork->SetPaused(paused);
+  }
+  return SWITCH_STATUS_SUCCESS;
 }
 
 // switch_separate_string cuts the JSON payload at its first space, so the
@@ -607,15 +613,11 @@ switch_status_t SendTextToForks(switch_core_session_t* session, const char* payl
     return SWITCH_STATUS_FALSE;
   }
 
-  std::vector<std::shared_ptr<ForkSession>> forks;
-  {
-    const std::scoped_lock lock(g_state->registry_mutex);
-    const auto it = g_state->registry.find(switch_core_session_get_uuid(session));
-    if (it == g_state->registry.end()) {
-      error = "no fork running on this channel";
-      return SWITCH_STATUS_FALSE;
-    }
-    forks = it->second;
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
   }
 
   bool delivered = false;
@@ -637,8 +639,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown);
 SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shutdown, nullptr);
 
-#define AUDIO_FORK_API_SYNTAX \
-  "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> send_text <json>"
+#define AUDIO_FORK_API_SYNTAX                                                   \
+  "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> " \
+  "send_text <json> | <uuid> pause | <uuid> resume"
 
 SWITCH_STANDARD_API(uuid_audio_fork_api) {
   (void)session;
@@ -673,6 +676,10 @@ SWITCH_STANDARD_API(uuid_audio_fork_api) {
     if (status != SWITCH_STATUS_SUCCESS) {
       error = "no fork running on this channel";
     }
+  } else if (!strcasecmp(argv[1], "pause")) {
+    status = SetForksPaused(target, true, error);
+  } else if (!strcasecmp(argv[1], "resume")) {
+    status = SetForksPaused(target, false, error);
   } else if (!strcasecmp(argv[1], "send_text")) {
     status = SendTextToForks(target, SendTextPayload(cmd), error);
   } else {
@@ -768,6 +775,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load) {
                  "status");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid start");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid stop");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid pause");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid resume");
 
   g_state = state.release();
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,

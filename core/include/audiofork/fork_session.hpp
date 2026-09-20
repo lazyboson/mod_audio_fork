@@ -66,7 +66,9 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::size_t playback_buffered_bytes = 0;
     std::uint64_t pending_texts_dropped = 0;
     std::uint64_t playback_bytes_dropped = 0;
+    std::uint64_t paused_bytes = 0;
     bool degraded = false;
+    bool paused = false;
   };
 
   static constexpr std::size_t kMaxPendingTexts = 64;
@@ -86,6 +88,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void Start();
   void Pump();
   void Stop();
+  // Any thread. Pausing discards outbound frames at the media thread and sends
+  // nothing to the server: the wire protocol has no pause message. Playback
+  // (server to caller) is unaffected and the socket stays up.
+  void SetPaused(bool paused);
   // False means the text was refused outright (teardown started, or a digit the
   // wire protocol has no encoding for); true only means it was handed to the
   // shard, which may still drop it if the queue overflows or the socket refuses.
@@ -165,6 +171,11 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   bool reconnecting_ = false;
   bool dropping_ = false;
   bool pool_starved_ = false;
+
+  // Flipped from a control thread and read on the media thread. Relaxed on
+  // both sides: it publishes no other state, and a frame on either side of the
+  // flip is equally correct, so the media path pays for no fence.
+  std::atomic<bool> paused_{false};
   bool bye_sent_ = false;
   std::optional<std::chrono::steady_clock::time_point> disconnected_at_;
   std::optional<std::chrono::steady_clock::time_point> drain_deadline_;
@@ -186,6 +197,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   std::atomic<std::size_t> playback_buffered_bytes_{0};
   std::atomic<std::uint64_t> pending_texts_dropped_{0};
   std::atomic<std::uint64_t> playback_bytes_dropped_{0};
+  std::atomic<std::uint64_t> paused_bytes_{0};
   std::atomic<bool> degraded_{false};
 };
 

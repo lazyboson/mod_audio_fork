@@ -63,6 +63,10 @@ bool ForkSession::PushAudio(ConstByteSpan pcm) noexcept {
     case SessionState::kDead:
       return false;
   }
+  if (paused_.load(std::memory_order_relaxed)) {
+    paused_bytes_.fetch_add(pcm.size(), std::memory_order_relaxed);
+    return true;
+  }
   if (!ring_->Push(pcm)) {
     media_dropped_bytes_.fetch_add(pcm.size(), std::memory_order_relaxed);
     return false;
@@ -96,6 +100,8 @@ AudioFormat ForkSession::playback_format() const noexcept {
   return AudioFormat{playback_rate_.load(std::memory_order_relaxed),
                      playback_channels_.load(std::memory_order_relaxed)};
 }
+
+void ForkSession::SetPaused(bool paused) { paused_.store(paused, std::memory_order_relaxed); }
 
 void ForkSession::Stop() {
   // may be called from the media or a control thread: never touch the
@@ -577,7 +583,9 @@ ForkSession::Stats ForkSession::stats() const {
                playback_buffered_bytes_.load(std::memory_order_relaxed),
                pending_texts_dropped_.load(std::memory_order_relaxed),
                playback_bytes_dropped_.load(std::memory_order_relaxed),
-               degraded_.load(std::memory_order_relaxed)};
+               paused_bytes_.load(std::memory_order_relaxed),
+               degraded_.load(std::memory_order_relaxed),
+               paused_.load(std::memory_order_relaxed)};
 }
 
 std::size_t ForkSession::MinimumSlabs(const Tuning& tuning, std::size_t slab_bytes) {
