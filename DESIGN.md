@@ -214,7 +214,9 @@ Events (subclass `mod_audio_fork::`): `connect`, `connect_failed`, `reconnecting
 | `reconnect-backoff-min-ms` / `max-ms` | 250 / 5000 |
 | `coalesce-max-ms` | 100 |
 | `max-forks-per-call` | 4 |
-| TLS: CA path, client cert/key (mTLS), verify mode | system CA, verify on |
+| `tls-ca-file` (a PEM file, not a directory — lws offers no CA dir option) | empty = OS trust store |
+| `tls-cert-file` / `tls-key-file` (mTLS, both or neither) | empty = no client certificate |
+| `tls-verify` | true |
 
 ## 10. Testing strategy (Issues 15–18)
 
