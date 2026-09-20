@@ -541,11 +541,9 @@ switch_status_t StopForks(switch_core_session_t* session) {
   std::vector<std::shared_ptr<ForkSession>> forks;
   {
     const std::scoped_lock lock(g_state->registry_mutex);
-    const auto it = g_state->registry.find(uuid);
-    if (it == g_state->registry.end()) {
-      return SWITCH_STATUS_FALSE;
+    if (const auto it = g_state->registry.find(uuid); it != g_state->registry.end()) {
+      forks = it->second;
     }
-    forks = it->second;
   }
   for (auto& fork : forks) {
     fork->Stop();
@@ -560,7 +558,9 @@ switch_status_t StopForks(switch_core_session_t* session) {
     switch_channel_set_private(channel, kDtmfHookKey, nullptr);
     (void)switch_core_event_hook_remove_recv_dtmf(session, OnRecvDtmf);
   }
-  return SWITCH_STATUS_SUCCESS;
+  // forks that already retired on their own still leave the channel to clean
+  // up, but there was nothing here to stop
+  return forks.empty() ? SWITCH_STATUS_FALSE : SWITCH_STATUS_SUCCESS;
 }
 
 // switch_separate_string cuts the JSON payload at its first space, so the
@@ -683,6 +683,7 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
   std::size_t buffered = 0;
   std::uint64_t playback_played = 0;
   std::uint64_t barge_ins = 0;
+  std::uint64_t texts_dropped = 0;
   {
     const std::scoped_lock lock(g_state->registry_mutex);
     calls = g_state->registry.size();
@@ -697,6 +698,7 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
         buffered += stats.buffered_bytes;
         playback_played += stats.playback_bytes_played;
         barge_ins += stats.barge_ins;
+        texts_dropped += stats.pending_texts_dropped;
       }
     }
   }
@@ -706,13 +708,15 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
       "{\"calls\":%lu,\"forks\":%lu,\"shards\":%lu,\"sent_bytes\":%llu,"
       "\"media_dropped_bytes\":%llu,\"buffer_dropped_bytes\":%llu,\"reconnects\":%llu,"
       "\"buffered_bytes\":%lu,\"playback_bytes_played\":%llu,\"barge_ins\":%llu,"
+      "\"pending_texts_dropped\":%llu,"
       "\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
       static_cast<unsigned long>(calls), static_cast<unsigned long>(forks),
       static_cast<unsigned long>(g_state->shards->shard_count()),
       static_cast<unsigned long long>(sent), static_cast<unsigned long long>(media_dropped),
       static_cast<unsigned long long>(buffer_dropped), static_cast<unsigned long long>(reconnects),
       static_cast<unsigned long>(buffered), static_cast<unsigned long long>(playback_played),
-      static_cast<unsigned long long>(barge_ins), static_cast<unsigned long>(pool.allocated_bytes),
+      static_cast<unsigned long long>(barge_ins), static_cast<unsigned long long>(texts_dropped),
+      static_cast<unsigned long>(pool.allocated_bytes),
       static_cast<unsigned long>(pool.leased_slabs));
   return SWITCH_STATUS_SUCCESS;
 }
