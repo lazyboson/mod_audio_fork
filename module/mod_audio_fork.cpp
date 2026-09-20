@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -173,11 +174,31 @@ ModuleConfig LoadConfig() {
         config.reconnect_max = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "max-forks-per-call")) {
         config.max_forks_per_call = static_cast<std::size_t>(std::max(number, 1));
+      } else if (!strcasecmp(name, "tls-ca-file")) {
+        config.tls.ca_file = value;
+      } else if (!strcasecmp(name, "tls-cert-file")) {
+        config.tls.cert_file = value;
+      } else if (!strcasecmp(name, "tls-key-file")) {
+        config.tls.key_file = value;
+      } else if (!strcasecmp(name, "tls-verify")) {
+        config.tls.verify = switch_true(value) != 0;
       }
     }
   }
   switch_xml_free(xml);
-  return audiofork::SanitizeConfig(config);
+  const bool half_a_client_certificate =
+      config.tls.cert_file.empty() != config.tls.key_file.empty();
+  const ModuleConfig sanitized = audiofork::SanitizeConfig(config);
+  if (half_a_client_certificate) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                      "tls-cert-file and tls-key-file must both be set; "
+                      "continuing without a client certificate\n");
+  }
+  if (!sanitized.tls.verify) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                      "tls-verify is off: wss:// forks accept any server certificate\n");
+  }
+  return sanitized;
 }
 
 bool ParseEndpoint(const char* url, Endpoint& endpoint, std::string& error) {
@@ -185,38 +206,11 @@ bool ParseEndpoint(const char* url, Endpoint& endpoint, std::string& error) {
     error = "missing url";
     return false;
   }
-  std::string text(url);
-  if (text.rfind("wss://", 0) == 0) {
-    endpoint.tls = true;
-    text.erase(0, 6);
-  } else if (text.rfind("ws://", 0) == 0) {
-    endpoint.tls = false;
-    text.erase(0, 5);
-  } else {
-    error = "url must start with ws:// or wss://";
+  const std::optional<Endpoint> parsed = audiofork::ParseWsUrl(url, error);
+  if (!parsed.has_value()) {
     return false;
   }
-  const std::size_t slash = text.find('/');
-  std::string authority = text.substr(0, slash);
-  endpoint.path = slash == std::string::npos ? "/" : text.substr(slash);
-  const std::size_t colon = authority.rfind(':');
-  if (colon != std::string::npos) {
-    endpoint.port = static_cast<std::uint16_t>(atoi(authority.substr(colon + 1).c_str()));
-    authority.erase(colon);
-  } else {
-    endpoint.port = endpoint.tls ? 443 : 80;
-  }
-  endpoint.host = authority;
-  if (endpoint.host.empty() || endpoint.port == 0) {
-    error = "url has no host or port";
-    return false;
-  }
-  if (endpoint.tls) {
-    // TLS lands with the vendored-lws build in M5; refusing beats silently
-    // streaming call audio in the clear
-    error = "wss:// is not supported yet in this build";
-    return false;
-  }
+  endpoint = *parsed;
   return true;
 }
 
