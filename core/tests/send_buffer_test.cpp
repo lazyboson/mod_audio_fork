@@ -39,7 +39,7 @@ std::vector<std::uint8_t> DrainAll(SendBuffer& buffer) {
 TEST(SendBuffer, RoundTripsWithinCap) {
   SendBuffer buffer(MakePool(8), 1024);
   const auto payload = Ramp(600);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 0U);
   EXPECT_EQ(buffer.size(), 600U);
   EXPECT_EQ(DrainAll(buffer), payload);
 }
@@ -47,14 +47,14 @@ TEST(SendBuffer, RoundTripsWithinCap) {
 TEST(SendBuffer, SpansMultipleSlabs) {
   SendBuffer buffer(MakePool(8), 2048);
   const auto payload = Ramp(1000);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 0U);
   EXPECT_EQ(DrainAll(buffer), payload);
 }
 
 TEST(SendBuffer, PeekNeverSpansSlabsButDrainIsContiguous) {
   SendBuffer buffer(MakePool(8), 2048);
   const auto payload = Ramp(700);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 0U);
   const ConstByteSpan first = buffer.Peek(700);
   EXPECT_LE(first.size(), kSlab);
   EXPECT_GT(first.size(), 0U);
@@ -63,9 +63,9 @@ TEST(SendBuffer, PeekNeverSpansSlabsButDrainIsContiguous) {
 
 TEST(SendBuffer, DropsOldestWhenCapExceeded) {
   SendBuffer buffer(MakePool(16), 512);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(512, 0))), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(512, 0))).dropped_bytes, 0U);
   const auto fresh = Ramp(100, 100);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(fresh)), 100U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(fresh)).dropped_bytes, 100U);
   EXPECT_EQ(buffer.size(), 512U);
 
   const auto remaining = DrainAll(buffer);
@@ -76,10 +76,18 @@ TEST(SendBuffer, DropsOldestWhenCapExceeded) {
   EXPECT_EQ(remaining[0], 100);
 }
 
+TEST(SendBuffer, OwnCapOverflowIsNotPoolExhaustion) {
+  SendBuffer buffer(MakePool(16), 512);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(512, 0))).dropped_bytes, 0U);
+  const SendBuffer::AppendResult result = buffer.Append(ConstByteSpan(Ramp(100, 100)));
+  EXPECT_EQ(result.dropped_bytes, 100U);
+  EXPECT_FALSE(result.pool_exhausted);
+}
+
 TEST(SendBuffer, AppendLargerThanCapKeepsNewestTail) {
   SendBuffer buffer(MakePool(16), 256);
   const auto payload = Ramp(1000);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 744U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 744U);
   EXPECT_EQ(buffer.size(), 256U);
   const auto kept = DrainAll(buffer);
   EXPECT_EQ(kept, std::vector<std::uint8_t>(payload.end() - 256, payload.end()));
@@ -88,10 +96,11 @@ TEST(SendBuffer, AppendLargerThanCapKeepsNewestTail) {
 TEST(SendBuffer, PoolExhaustionDegradesLikeAFullBuffer) {
   // cap allows 4 slabs of audio but the pool only ever yields 2
   SendBuffer buffer(MakePool(2), kSlab * 4);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(kSlab * 2))), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(kSlab * 2))).dropped_bytes, 0U);
   const auto fresh = Ramp(kSlab, 7);
-  const std::size_t dropped = buffer.Append(ConstByteSpan(fresh));
-  EXPECT_EQ(dropped, kSlab);
+  const SendBuffer::AppendResult result = buffer.Append(ConstByteSpan(fresh));
+  EXPECT_EQ(result.dropped_bytes, kSlab);
+  EXPECT_TRUE(result.pool_exhausted);
   EXPECT_EQ(buffer.size(), kSlab * 2);
   const auto kept = DrainAll(buffer);
   EXPECT_EQ(std::vector<std::uint8_t>(kept.end() - kSlab, kept.end()), fresh);
@@ -99,13 +108,13 @@ TEST(SendBuffer, PoolExhaustionDegradesLikeAFullBuffer) {
 
 TEST(SendBuffer, ZeroCapDropsEverything) {
   SendBuffer buffer(MakePool(4), 0);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(100))), 100U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(100))).dropped_bytes, 100U);
   EXPECT_TRUE(buffer.empty());
 }
 
 TEST(SendBuffer, EmptyAppendAndPeekAreNoOps) {
   SendBuffer buffer(MakePool(4), 1024);
-  EXPECT_EQ(buffer.Append(ConstByteSpan()), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan()).dropped_bytes, 0U);
   EXPECT_TRUE(buffer.Peek(64).empty());
   buffer.Consume(999);
   EXPECT_TRUE(buffer.empty());
@@ -114,7 +123,7 @@ TEST(SendBuffer, EmptyAppendAndPeekAreNoOps) {
 TEST(SendBuffer, SetCapShrinkDropsOldestImmediately) {
   SendBuffer buffer(MakePool(16), 1024);
   const auto payload = Ramp(1000);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 0U);
   EXPECT_EQ(buffer.SetCap(256), 744U);
   EXPECT_EQ(buffer.size(), 256U);
   EXPECT_EQ(DrainAll(buffer), std::vector<std::uint8_t>(payload.end() - 256, payload.end()));
@@ -123,7 +132,7 @@ TEST(SendBuffer, SetCapShrinkDropsOldestImmediately) {
 TEST(SendBuffer, SetCapGrowKeepsData) {
   SendBuffer buffer(MakePool(16), 256);
   const auto payload = Ramp(200);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(payload)).dropped_bytes, 0U);
   EXPECT_EQ(buffer.SetCap(1024), 0U);
   EXPECT_EQ(DrainAll(buffer), payload);
 }
@@ -131,7 +140,7 @@ TEST(SendBuffer, SetCapGrowKeepsData) {
 TEST(SendBuffer, ClearReleasesSlabsBackToPool) {
   auto pool = MakePool(8);
   SendBuffer buffer(pool, 2048);
-  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(1000))), 0U);
+  EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(1000))).dropped_bytes, 0U);
   EXPECT_GT(pool.stats().leased_slabs, 0U);
   buffer.Clear();
   EXPECT_TRUE(buffer.empty());
@@ -143,7 +152,7 @@ TEST(SendBuffer, SteadyStateRecyclesSlabsInsteadOfGrowing) {
   SendBuffer buffer(pool, kSlab * 40);
   // a healthy fork: append a frame, immediately drain it, forever
   for (int round = 0; round < 500; ++round) {
-    EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(160))), 0U);
+    EXPECT_EQ(buffer.Append(ConstByteSpan(Ramp(160))).dropped_bytes, 0U);
     (void)DrainAll(buffer);
   }
   EXPECT_LE(pool.stats().allocated_bytes, kSlab * 2);

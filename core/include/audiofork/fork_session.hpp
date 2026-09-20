@@ -41,6 +41,8 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::size_t send_cap_bytes = 0;
     std::size_t handoff_bytes = 0;
     std::size_t coalesce_max_bytes = 0;
+    // zero disables degradation: the send cap never shrinks (DESIGN.md §5)
+    std::size_t emergency_cap_bytes = 0;
     std::chrono::milliseconds drain_timeout{2000};
     ReconnectBackoff::Options backoff;
     std::uint64_t backoff_seed = 0;
@@ -63,9 +65,18 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
     std::uint64_t barge_ins = 0;
     std::size_t playback_buffered_bytes = 0;
     std::uint64_t pending_texts_dropped = 0;
+    std::uint64_t playback_bytes_dropped = 0;
+    std::uint64_t paused_bytes = 0;
+    bool degraded = false;
+    bool paused = false;
   };
 
   static constexpr std::size_t kMaxPendingTexts = 64;
+
+  // A fork that cannot hold one coalesced message plus a slab for playback has
+  // no working set: it could only drop. The module refuses to start one rather
+  // than let the global cap produce forks that are born broken (DESIGN.md §5).
+  [[nodiscard]] static std::size_t MinimumSlabs(const Tuning& tuning, std::size_t slab_bytes);
 
   [[nodiscard]] static std::shared_ptr<ForkSession> Create(ForkParams params, Tuning tuning,
                                                            NetPort& net, EventSink& events,
@@ -77,11 +88,19 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void Start();
   void Pump();
   void Stop();
+  // Any thread. Pausing discards outbound frames at the media thread and sends
+  // nothing to the server: the wire protocol has no pause message. Playback
+  // (server to caller) is unaffected and the socket stays up.
+  void SetPaused(bool paused);
   // False means the text was refused outright (teardown started, or a digit the
   // wire protocol has no encoding for); true only means it was handed to the
   // shard, which may still drop it if the queue overflows or the socket refuses.
   [[nodiscard]] bool SendText(std::string text);
   [[nodiscard]] bool SendDtmf(char digit, std::uint32_t duration_ms);
+  // Any thread. Points the fork at another server: the current connection is
+  // said goodbye to and closed, and the reconnect that follows carries the
+  // buffered audio to the new endpoint. False means teardown already started.
+  [[nodiscard]] bool Modify(Endpoint endpoint);
   void set_on_finished(std::function<void()> callback) { on_finished_ = std::move(callback); }
 
   [[nodiscard]] bool PushAudio(ConstByteSpan pcm) noexcept;
@@ -104,6 +123,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
 
  private:
   void Apply(SessionAction action);
+  void ApplyModify(Endpoint endpoint);
   void BeginConnect();
   void BeginDrain();
   void BeginClose();
@@ -120,6 +140,9 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   void HandleMark(std::string name);
   void Emit(ForkEventType type, std::string detail = {});
   void EmitOverrunIfNewEpisode(std::size_t dropped);
+  // Returns the bytes the shrunken cap shed, 0 when already degraded.
+  [[nodiscard]] std::size_t DegradeIfNewEpisode();
+  void RestoreCapIfDrained();
   [[nodiscard]] std::uint64_t BytesToMs(std::uint64_t bytes) const;
 
   ForkParams params_;
@@ -152,6 +175,13 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
 
   bool reconnecting_ = false;
   bool dropping_ = false;
+  bool endpoint_changed_ = false;
+  bool pool_starved_ = false;
+
+  // Flipped from a control thread and read on the media thread. Relaxed on
+  // both sides: it publishes no other state, and a frame on either side of the
+  // flip is equally correct, so the media path pays for no fence.
+  std::atomic<bool> paused_{false};
   bool bye_sent_ = false;
   std::optional<std::chrono::steady_clock::time_point> disconnected_at_;
   std::optional<std::chrono::steady_clock::time_point> drain_deadline_;
@@ -172,6 +202,9 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   std::atomic<std::uint64_t> barge_ins_{0};
   std::atomic<std::size_t> playback_buffered_bytes_{0};
   std::atomic<std::uint64_t> pending_texts_dropped_{0};
+  std::atomic<std::uint64_t> playback_bytes_dropped_{0};
+  std::atomic<std::uint64_t> paused_bytes_{0};
+  std::atomic<bool> degraded_{false};
 };
 
 }  // namespace audiofork

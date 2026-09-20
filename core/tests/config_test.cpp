@@ -28,7 +28,19 @@ TEST(SanitizeConfig, DefaultsPassThroughUnchanged) {
   EXPECT_EQ(sanitized.coalesce_max, milliseconds{100});
   EXPECT_EQ(sanitized.reconnect_min, milliseconds{250});
   EXPECT_EQ(sanitized.reconnect_max, milliseconds{5000});
+  EXPECT_EQ(sanitized.emergency_buffer, milliseconds{2000});
   EXPECT_EQ(sanitized.max_forks_per_call, 4U);
+}
+
+TEST(SanitizeConfig, EmergencyBufferIsClampedIntoTheSendBuffer) {
+  ModuleConfig config;
+  config.send_buffer = milliseconds{5000};
+  config.emergency_buffer = milliseconds{0};
+  EXPECT_GE(SanitizeConfig(config).emergency_buffer, milliseconds{20});
+
+  config.emergency_buffer = milliseconds{60000};
+  const ModuleConfig widened = SanitizeConfig(config);
+  EXPECT_EQ(widened.emergency_buffer, widened.send_buffer);
 }
 
 TEST(SanitizeConfig, ClampsNonsenseInsteadOfFailing) {

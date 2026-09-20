@@ -63,6 +63,10 @@ bool ForkSession::PushAudio(ConstByteSpan pcm) noexcept {
     case SessionState::kDead:
       return false;
   }
+  if (paused_.load(std::memory_order_relaxed)) {
+    paused_bytes_.fetch_add(pcm.size(), std::memory_order_relaxed);
+    return true;
+  }
   if (!ring_->Push(pcm)) {
     media_dropped_bytes_.fetch_add(pcm.size(), std::memory_order_relaxed);
     return false;
@@ -97,6 +101,8 @@ AudioFormat ForkSession::playback_format() const noexcept {
                      playback_channels_.load(std::memory_order_relaxed)};
 }
 
+void ForkSession::SetPaused(bool paused) { paused_.store(paused, std::memory_order_relaxed); }
+
 void ForkSession::Stop() {
   // may be called from the media or a control thread: never touch the
   // connection here, only hop to the shard
@@ -130,11 +136,55 @@ bool ForkSession::SendDtmf(char digit, std::uint32_t duration_ms) {
   return SendText(std::move(*encoded));
 }
 
+bool ForkSession::Modify(Endpoint endpoint) {
+  switch (state_.state()) {
+    case SessionState::kConnecting:
+    case SessionState::kActive:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      return false;
+  }
+  // may be called from a control or FreeSWITCH session thread: never touch the
+  // connection here, only hop to the shard
+  auto self = shared_from_this();
+  net_.Post(
+      [self, endpoint = std::move(endpoint)]() mutable { self->ApplyModify(std::move(endpoint)); });
+  return true;
+}
+
+void ForkSession::ApplyModify(Endpoint endpoint) {
+  switch (state_.state()) {
+    case SessionState::kConnecting:
+    case SessionState::kActive:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      return;
+  }
+  params_.endpoint = std::move(endpoint);
+  endpoint_changed_ = true;
+  backoff_.Reset();
+  if (connection_ == nullptr) {
+    return;
+  }
+  (void)connection_->SendText(EncodeBye());
+  connection_->Close();
+  // forgotten now rather than at OnClosed: what is buffered belongs to the new
+  // server, and a flush would otherwise hand it to the socket that is leaving
+  connection_ = nullptr;
+}
+
 void ForkSession::Pump() {
   DrainHandoffRing();
   PumpPlayback();
   if (state_.state() == SessionState::kActive) {
     FlushToConnection();
+    RestoreCapIfDrained();
     return;
   }
   if (state_.state() != SessionState::kDraining) {
@@ -211,7 +261,10 @@ void ForkSession::OnBinary(ConstByteSpan bytes) {
   }
   playback_bytes_received_.fetch_add(bytes.size(), std::memory_order_relaxed);
   const std::size_t refused = playback_->Append(bytes);
+  // audio refused while muted was discarded on purpose by a barge-in, so only
+  // the rest is a loss worth counting
   if (refused > 0 && !playback_->muted()) {
+    playback_bytes_dropped_.fetch_add(refused, std::memory_order_relaxed);
     Emit(ForkEventType::kError, "playback buffer overflowed, audio discarded");
   }
   if (!playback_started_ && !playback_->empty()) {
@@ -248,7 +301,10 @@ void ForkSession::Apply(SessionAction action) {
         Apply(state_.OnEvent(SessionEvent::kWsError).action);
         return;
       }
-      if (reconnecting_) {
+      // A modify points the fork at a server that never saw this stream, so it
+      // gets a plain hello: another server's gap and drop totals would mean
+      // nothing to it.
+      if (reconnecting_ && !endpoint_changed_) {
         const std::uint64_t gap_ms =
             disconnected_at_.has_value()
                 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -265,6 +321,11 @@ void ForkSession::Apply(SessionAction action) {
         reconnects_.fetch_add(1, std::memory_order_relaxed);
       } else {
         Emit(ForkEventType::kConnect);
+      }
+      if (endpoint_changed_) {
+        endpoint_changed_ = false;
+        reconnecting_ = false;
+        dropped_since_resume_ = 0;
       }
       disconnected_at_.reset();
       FlushPendingTexts();
@@ -365,12 +426,18 @@ void ForkSession::DrainHandoffRing() {
     if (count == 0) {
       return;
     }
-    const std::size_t dropped = buffer_.Append(ConstByteSpan(scratch.data(), count));
+    const SendBuffer::AppendResult result = buffer_.Append(ConstByteSpan(scratch.data(), count));
+    pool_starved_ = result.pool_exhausted;
+    if (result.pool_exhausted) {
+      const std::size_t shed = DegradeIfNewEpisode();
+      buffer_dropped_bytes_.fetch_add(shed, std::memory_order_relaxed);
+      dropped_since_resume_ += shed;
+    }
     buffered_bytes_.store(buffer_.size(), std::memory_order_relaxed);
-    if (dropped > 0) {
-      buffer_dropped_bytes_.fetch_add(dropped, std::memory_order_relaxed);
-      dropped_since_resume_ += dropped;
-      EmitOverrunIfNewEpisode(dropped);
+    if (result.dropped_bytes > 0) {
+      buffer_dropped_bytes_.fetch_add(result.dropped_bytes, std::memory_order_relaxed);
+      dropped_since_resume_ += result.dropped_bytes;
+      EmitOverrunIfNewEpisode(result.dropped_bytes);
     } else {
       dropping_ = false;
     }
@@ -460,6 +527,27 @@ void ForkSession::EmitOverrunIfNewEpisode(std::size_t dropped) {
   events_.Emit(event);
 }
 
+std::size_t ForkSession::DegradeIfNewEpisode() {
+  if (tuning_.emergency_cap_bytes == 0 || degraded_.load(std::memory_order_relaxed)) {
+    return 0;
+  }
+  degraded_.store(true, std::memory_order_relaxed);
+  const std::size_t shed = buffer_.SetCap(tuning_.emergency_cap_bytes);
+  Emit(ForkEventType::kDegraded, "global memory cap reached, send buffer cut to the emergency cap");
+  return shed;
+}
+
+void ForkSession::RestoreCapIfDrained() {
+  // An empty buffer is recovery only once the pool feeds this fork again:
+  // while the pool is dry every frame is dropped, so emptiness alone would
+  // restore the full cap once per tick and re-emit `degraded` each time.
+  if (!degraded_.load(std::memory_order_relaxed) || pool_starved_ || !buffer_.empty()) {
+    return;
+  }
+  (void)buffer_.SetCap(tuning_.send_cap_bytes);
+  degraded_.store(false, std::memory_order_relaxed);
+}
+
 void ForkSession::PumpPlayback() {
   if (!playback_.has_value()) {
     return;
@@ -544,7 +632,18 @@ ForkSession::Stats ForkSession::stats() const {
                playback_underruns_.load(std::memory_order_relaxed),
                barge_ins_.load(std::memory_order_relaxed),
                playback_buffered_bytes_.load(std::memory_order_relaxed),
-               pending_texts_dropped_.load(std::memory_order_relaxed)};
+               pending_texts_dropped_.load(std::memory_order_relaxed),
+               playback_bytes_dropped_.load(std::memory_order_relaxed),
+               paused_bytes_.load(std::memory_order_relaxed),
+               degraded_.load(std::memory_order_relaxed),
+               paused_.load(std::memory_order_relaxed)};
+}
+
+std::size_t ForkSession::MinimumSlabs(const Tuning& tuning, std::size_t slab_bytes) {
+  if (slab_bytes == 0) {
+    return 0;
+  }
+  return (tuning.coalesce_max_bytes + slab_bytes - 1) / slab_bytes + 1;
 }
 
 }  // namespace audiofork
