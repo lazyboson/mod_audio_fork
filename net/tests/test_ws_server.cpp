@@ -4,6 +4,7 @@
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -31,7 +32,11 @@ constexpr std::array<lws_protocols, 2> kProtocols{{
 
 }  // namespace
 
-std::unique_ptr<TestWsServer> TestWsServer::Start() {
+std::string TestTlsPath(std::string_view name) {
+  return std::string(AUDIOFORK_TEST_TLS_DIR) + "/" + std::string(name);
+}
+
+std::unique_ptr<TestWsServer> TestWsServer::Start(const TestWsTls& tls) {
   EnsureLwsLogPolicy();
   auto server = std::make_unique<TestWsServer>(PrivateTag{});
   lws_context_creation_info info{};
@@ -40,6 +45,15 @@ std::unique_ptr<TestWsServer> TestWsServer::Start() {
   info.protocols = kProtocols.data();
   info.user = server.get();
   info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+  if (!tls.cert_file.empty()) {
+    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    info.ssl_cert_filepath = tls.cert_file.c_str();
+    info.ssl_private_key_filepath = tls.key_file.c_str();
+    if (!tls.client_ca_file.empty()) {
+      info.ssl_ca_filepath = tls.client_ca_file.c_str();
+      info.options |= LWS_SERVER_OPTION_REQUIRE_VALID_OPENSSL_CLIENT_CERT;
+    }
+  }
   server->context_ = lws_create_context(&info);
   if (server->context_ == nullptr) {
     return nullptr;

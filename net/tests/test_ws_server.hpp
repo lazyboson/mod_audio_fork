@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -15,6 +17,18 @@ struct lws_context;
 
 namespace audiofork::net {
 
+// Absolute path to one of the test-only credentials in tests/tls (see the
+// README there).
+[[nodiscard]] std::string TestTlsPath(std::string_view name);
+
+// Empty cert_file leaves the server in plaintext. A non-empty client_ca_file
+// makes lws demand a client certificate that CA signed.
+struct TestWsTls {
+  std::string cert_file;
+  std::string key_file;
+  std::string client_ca_file;
+};
+
 // Test-only echo server: every text/binary message is echoed back on the same
 // connection. Runs its own lws context on its own thread; the public methods
 // are thread-safe and post onto that thread.
@@ -22,7 +36,7 @@ class TestWsServer {
   struct PrivateTag {};
 
  public:
-  [[nodiscard]] static std::unique_ptr<TestWsServer> Start();
+  [[nodiscard]] static std::unique_ptr<TestWsServer> Start(const TestWsTls& tls = {});
 
   explicit TestWsServer(PrivateTag);
   ~TestWsServer();
