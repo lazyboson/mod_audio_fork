@@ -43,7 +43,7 @@ a playback media bug (DESIGN.md §13).
 ## Using it
 
 ```
-uuid_audio_fork <uuid> start ws://host:port/path <mono|mixed|stereo> <rate> [metadata-json]
+uuid_audio_fork <uuid> start ws[s]://host[:port]/path <mono|mixed|stereo> <rate> [metadata-json]
 uuid_audio_fork <uuid> stop
 uuid_audio_fork <uuid> send_text <json>
 audio_fork status          # JSON counters: forks, bytes, drops, reconnects, pool use
@@ -56,6 +56,23 @@ messages, drop-oldest) and flushed straight after the `hello`.
 
 Caller DTMF is forwarded automatically — no command needed — to every fork on
 the channel as `{"type":"dtmf","digit":"5","durationMs":160}`.
+
+## TLS
+
+`wss://` URLs are TLS, defaulting to port 443, and are configured once for the
+whole module in `audio_fork.conf.xml` — there is no per-fork override:
+
+| Param | Meaning |
+|---|---|
+| `tls-ca-file` | PEM file of CAs to trust. Empty uses the OS trust store. A file, not a directory — libwebsockets offers no CA-directory option. |
+| `tls-cert-file` | Client certificate (PEM) for mutual TLS. |
+| `tls-key-file` | Its private key (PEM). |
+| `tls-verify` | `true` by default. `false` accepts any server certificate — self-signed, expired, wrong hostname — and is for test rigs only; the module logs a warning at load. |
+
+For mutual TLS set `tls-cert-file` and `tls-key-file` together; with only one of
+the two the module logs an error and connects without a client certificate. A
+failed handshake surfaces exactly like a refused connection: a `connect_failed`
+event followed by the usual reconnect backoff.
 
 Events are fired as custom events with subclass `mod_audio_fork::<name>`
 (`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`,

@@ -12,6 +12,8 @@ script scenarios without editing code.
   MOCK_WS_PLAYBACK_MS after hello, stream N ms of 16 kHz mono L16 tone back at
                       real-time pace, then a "rig-end" mark
   MOCK_WS_REPORT      path to write a JSON report per connection
+  MOCK_WS_TLS_CERT    server certificate (PEM); set with MOCK_WS_TLS_KEY to
+  MOCK_WS_TLS_KEY     serve wss:// instead of ws://
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import json
 import math
 import os
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -203,6 +206,8 @@ STALL_AFTER = int(os.environ.get("MOCK_WS_STALL_AFTER", "0"))
 DROP_AFTER = int(os.environ.get("MOCK_WS_DROP_AFTER", "0"))
 PLAYBACK_MS = int(os.environ.get("MOCK_WS_PLAYBACK_MS", "0"))
 REPORT_PATH = os.environ.get("MOCK_WS_REPORT", "")
+TLS_CERT = os.environ.get("MOCK_WS_TLS_CERT", "")
+TLS_KEY = os.environ.get("MOCK_WS_TLS_KEY", "")
 REPORT_WRITE_LOCK = threading.Lock()
 
 
@@ -244,7 +249,7 @@ def _play(conn: socket.socket, send_lock: threading.Lock, stats: dict, stop: thr
         return
 
 
-def _handle(conn: socket.socket) -> None:
+def _handle(conn: socket.socket, tls: ssl.SSLContext | None) -> None:
     conn.settimeout(30)
     frames = 0
     saw_hello = False
@@ -252,6 +257,8 @@ def _handle(conn: socket.socket) -> None:
     stop = threading.Event()
     stats = None
     try:
+        if tls is not None:
+            conn = tls.wrap_socket(conn, server_side=True)
         _handshake(conn)
         stats = REPORT.new_connection()
         while True:
@@ -327,15 +334,19 @@ def _handle(conn: socket.socket) -> None:
 
 def main() -> int:
     port = int(os.environ.get("MOCK_WS_PORT", "9099"))
+    tls = None
+    if TLS_CERT and TLS_KEY:
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(TLS_CERT, TLS_KEY)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("0.0.0.0", port))
     listener.listen(128)
-    print(f"mock ws server listening on {port}", flush=True)
+    print(f"mock ws server listening on {port} ({'wss' if tls else 'ws'})", flush=True)
     try:
         while True:
             conn, _ = listener.accept()
-            threading.Thread(target=_handle, args=(conn,), daemon=True).start()
+            threading.Thread(target=_handle, args=(conn, tls), daemon=True).start()
     except KeyboardInterrupt:
         return 0
     finally:

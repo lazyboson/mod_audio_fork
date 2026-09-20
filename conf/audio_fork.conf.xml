@@ -26,5 +26,15 @@
     <param name="reconnect-backoff-max-ms" value="5000"/>
 
     <param name="max-forks-per-call" value="4"/>
+
+    <!-- wss:// trust. An empty ca-file uses the OS trust store; cert and key
+         are the client certificate for mTLS and are set together or not at all -->
+    <param name="tls-ca-file" value=""/>
+    <param name="tls-cert-file" value=""/>
+    <param name="tls-key-file" value=""/>
+
+    <!-- off accepts any server certificate, including self-signed and expired,
+         and skips the hostname check: test rigs only -->
+    <param name="tls-verify" value="true"/>
   </settings>
 </configuration>

@@ -214,7 +214,9 @@ Events (subclass `mod_audio_fork::`): `connect`, `connect_failed`, `reconnecting
 | `reconnect-backoff-min-ms` / `max-ms` | 250 / 5000 |
 | `coalesce-max-ms` | 100 |
 | `max-forks-per-call` | 4 |
-| TLS: CA path, client cert/key (mTLS), verify mode | system CA, verify on |
+| `tls-ca-file` (a PEM file, not a directory — lws offers no CA dir option) | empty = OS trust store |
+| `tls-cert-file` / `tls-key-file` (mTLS, both or neither) | empty = no client certificate |
+| `tls-verify` | true |
 
 ## 10. Testing strategy (Issues 15–18)
 
@@ -304,7 +306,7 @@ unverified and worth checking before the first glibc deployment.
 
 | Dependency | Stage | Strategy |
 |---|---|---|
-| libwebsockets | runtime | Vendored via CMake FetchContent at a pinned tag; built `-fPIC`, static-linked into `mod_audio_fork.so` with `-fvisibility=hidden` and a version script exporting only the FS module-interface symbol. Identical lws behavior on every host; no symbol collisions with other modules. |
+| libwebsockets | runtime | Vendored via CMake FetchContent at a pinned tag; built `-fPIC`, static-linked into `mod_audio_fork.so` with `-fvisibility=hidden` and a version script exporting only the FS module-interface symbol. Identical lws behavior on every host; no symbol collisions with other modules. Carries one patch (`net/patch_lws_client_http.cmake`): 4.3.3 frees the wsi when the HTTP upgrade request fails to write and then reports it alive, so the caller dereferences it. Re-check it on every lws bump — the build fails if the site stops matching. |
 | OpenSSL | runtime | System library, dynamically linked — the same libssl/libcrypto FreeSWITCH already has loaded. Never bundled: two OpenSSLs in one process is a crash source. Distro security updates apply automatically. |
 | Resampler | runtime | None shipped. FreeSWITCH core's `switch_resample_*` (Speex-based) implements the core `Resampler` port; core tests use a test implementation. |
 | JSON | compile-time | nlohmann/json, header-only, vendored at a pinned version, compiled into the `.so`. Control-plane only. |

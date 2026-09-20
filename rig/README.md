@@ -9,7 +9,8 @@ WebSocket peer (DESIGN.md §10, decision 17).
 | `conf/` | The whole FreeSWITCH configuration the rig runs on. Alpine's `freeswitch` package ships none, so the rig mounts this tree over `/etc/freeswitch`: `mod_audio_fork` plus the six modules the smoke needs, an event socket on 127.0.0.1:8021, and the dialplan. `mod_sofia` and `mod_verto` stay unloaded (DESIGN.md §13). |
 | `conf/dialplan/default.xml` | `rig-tone` extension: answers and plays a continuous tone so forked audio is deterministic. |
 | `smoke.sh` | Starts calls, forks them, asserts the mock server saw hello + audio of the right rate and loudness and that server audio reached the caller, tears down, asserts the graceful bye and that counters return to zero. |
-| `docker-compose.yml` | Wires FreeSWITCH (with the module), the mock server, and the smoke together. |
+| `freeswitch-entrypoint.sh` | Substitutes the container-local test-CA path into the repo's `conf/audio_fork.conf.xml` before starting FreeSWITCH, then execs it. |
+| `docker-compose.yml` | Wires FreeSWITCH (with the module), the mock servers, and the smoke together. |
 
 The SIPp call generator belongs to the nightly load tier and is not in the rig
 yet.
@@ -68,6 +69,25 @@ containers or overwrite each other's image; `COMPOSE_PROJECT_NAME` and
 | `MOCK_WS_DROP_AFTER` | compose environment | off | close the connection after N audio frames |
 
 `CALLS=1 docker compose ...` runs the single-call path.
+
+## The TLS leg
+
+`mock-wss` is the same `server.py` serving TLS on 9443. The last block of
+`smoke.sh` forks one call to `wss://mock-wss:9443/` and asserts the TLS mock
+saw exactly one `hello` and non-zero audio; the blocks before it are unchanged
+and still run over plaintext.
+
+Its credentials are `net/tests/tls/`, bind-mounted straight in, so
+`net/tests/tls/regen.sh` stays the repo's only certificate generator and the
+unit suite and the rig cannot drift apart. That is why the test server
+certificate carries `DNS:mock-wss` in its SAN.
+
+FreeSWITCH does not expand `$${vars}` inside a `param` value, so the CA path
+cannot be injected from the rig's `freeswitch.xml`. Rather than fork the
+shipped config, the rig mounts it as `/srv/audio_fork.conf.xml.in` and
+`freeswitch-entrypoint.sh` rewrites the one empty `tls-ca-file` value. That
+script fails loudly if the param ever stops matching, so the rig cannot
+silently fall back to the OS trust store and then pass for the wrong reason.
 
 ## Known gaps the rig found
 

@@ -15,6 +15,23 @@ target_compile_options(audiofork_warnings INTERFACE -Wall -Wextra -Werror -Wshad
 option(AUDIOFORK_FUZZ "Build libFuzzer targets (requires clang)" OFF)
 option(AUDIOFORK_BUILD_NET "Build the libwebsockets shim" ON)
 
+if(AUDIOFORK_BUILD_NET)
+  # Homebrew keeps openssl@3 off the default search path, and the vendored lws
+  # build resolves OpenSSL through the same cache variables this sets.
+  if(APPLE AND NOT DEFINED OPENSSL_ROOT_DIR)
+    execute_process(COMMAND brew --prefix openssl@3
+      OUTPUT_VARIABLE AUDIOFORK_BREW_OPENSSL OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(AUDIOFORK_BREW_OPENSSL)
+      set(OPENSSL_ROOT_DIR "${AUDIOFORK_BREW_OPENSSL}" CACHE PATH "")
+    endif()
+  endif()
+  # Never static: a second OpenSSL inside the module would collide with the one
+  # FreeSWITCH already has loaded (DESIGN.md §13).
+  set(OPENSSL_USE_STATIC_LIBS OFF)
+  find_package(OpenSSL REQUIRED)
+endif()
+
 # The module needs FreeSWITCH headers; default to building it only where they
 # are present so core/ and net/ stay buildable anywhere.
 find_package(PkgConfig QUIET)

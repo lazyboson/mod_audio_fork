@@ -3,9 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -13,68 +12,12 @@
 
 #include "audiofork/backoff.hpp"
 #include "test_ws_server.hpp"
+#include "ws_test_harness.hpp"
 
 namespace audiofork::net {
 namespace {
 
 using namespace std::chrono_literals;
-
-constexpr std::size_t kDefaultQueueCap = std::size_t{1024} * 1024;
-
-struct RecordingHandler : WsConnectionHandler {
-  std::mutex mutex;
-  std::condition_variable cv;
-  bool connected = false;
-  bool closed = false;
-  int close_count = 0;
-  bool connect_failed = false;
-  std::vector<std::string> texts;
-  std::vector<std::vector<std::uint8_t>> binaries;
-
-  void OnConnected() override {
-    const std::scoped_lock lock(mutex);
-    connected = true;
-    cv.notify_all();
-  }
-  void OnText(std::string_view text) override {
-    const std::scoped_lock lock(mutex);
-    texts.emplace_back(text);
-    cv.notify_all();
-  }
-  void OnBinary(ConstByteSpan bytes) override {
-    const std::scoped_lock lock(mutex);
-    binaries.emplace_back(bytes.begin(), bytes.end());
-    cv.notify_all();
-  }
-  void OnClosed(bool failed) override {
-    const std::scoped_lock lock(mutex);
-    closed = true;
-    ++close_count;
-    connect_failed = failed;
-    cv.notify_all();
-  }
-
-  template <typename Predicate>
-  [[nodiscard]] bool WaitFor(Predicate predicate, std::chrono::milliseconds timeout = 10s) {
-    std::unique_lock<std::mutex> lock(mutex);
-    return cv.wait_for(lock, timeout, predicate);
-  }
-};
-
-struct LoopRunner {
-  std::unique_ptr<WsEventLoop> loop;
-  std::thread thread;
-
-  explicit LoopRunner(std::chrono::milliseconds close_drain_timeout = 5000ms)
-      : loop(WsEventLoop::Create(close_drain_timeout)) {
-    EXPECT_NE(loop, nullptr);
-    thread = std::thread([this] { loop->Run(); });
-  }
-  ~LoopRunner() {
-    loop->Stop();
-    thread.join();
-  }
-};
 
 // The server records on its own thread, so poll rather than sleep a fixed time.
 [[nodiscard]] bool WaitForTranscript(const TestWsServer& server, std::size_t entries) {
@@ -398,7 +341,7 @@ TEST(WsClient, CloseIsBoundedWhenThePeerStopsReading) {
     }
   };
   StalledHandler sender;
-  LoopRunner runner{200ms};
+  LoopRunner runner{{}, 200ms};
   runner.loop->Post([&] {
     sender.self = runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender,
                                        /*max_queued_bytes=*/std::size_t{4} * 1024 * 1024);

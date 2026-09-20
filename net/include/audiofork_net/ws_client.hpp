@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "audiofork/bytes.hpp"
+#include "audiofork/config.hpp"
 
 struct lws;
 struct lws_context;
@@ -47,6 +48,7 @@ struct WsEndpoint {
   std::string host;
   std::uint16_t port = 0;
   std::string path = "/";
+  bool tls = false;
 };
 
 class WsEventLoop;
@@ -94,13 +96,16 @@ class WsEventLoop {
   struct PrivateTag {};
 
  public:
-  // close_drain_timeout bounds a graceful Close(): a peer that stops reading
-  // never lets the send queue drain, and the socket would otherwise stay open
-  // for as long as it stays silent.
+  // The TLS material applies to every connection this loop makes; lws reads the
+  // paths only while the context is being created, so `tls` need not outlive
+  // the call. close_drain_timeout bounds a graceful Close(): a peer that stops
+  // reading never lets the send queue drain, and the socket would otherwise
+  // stay open for as long as it stays silent.
   [[nodiscard]] static std::unique_ptr<WsEventLoop> Create(
+      const TlsOptions& tls = {},
       std::chrono::milliseconds close_drain_timeout = std::chrono::milliseconds{5000});
 
-  explicit WsEventLoop(PrivateTag);
+  WsEventLoop(PrivateTag, bool verify_peer);
   ~WsEventLoop();
   WsEventLoop(const WsEventLoop&) = delete;
   WsEventLoop& operator=(const WsEventLoop&) = delete;
@@ -134,6 +139,7 @@ class WsEventLoop {
 
   lws_context* context_ = nullptr;
   std::chrono::milliseconds close_drain_timeout_{5000};
+  const bool verify_peer_;
   std::atomic<bool> stop_{false};
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;
