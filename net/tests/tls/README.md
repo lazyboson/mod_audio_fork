@@ -7,7 +7,7 @@ anything real.**
 | File | Role |
 |---|---|
 | `ca.pem` / `ca.key` | The CA the tests pass as `tls-ca-file` |
-| `server.pem` / `server.key` | Server identity, `SAN DNS:localhost, IP:127.0.0.1` |
+| `server.pem` / `server.key` | Server identity, `SAN DNS:localhost, IP:127.0.0.1, DNS:mock-wss` — the rig's `mock-wss` service serves it too |
 | `server-othername.pem` / `.key` | Server identity for `other.example` only — the hostname-mismatch case |
 | `client.pem` / `client.key` | Client identity for the mTLS case |
 | `other-ca.pem` / `other-ca.key` | An unrelated CA — the untrusted-issuer case |

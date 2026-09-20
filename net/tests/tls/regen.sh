@@ -27,8 +27,10 @@ EXT
 ca ca "mod_audio_fork test CA"
 ca other-ca "mod_audio_fork unrelated CA"
 
+# mock-wss is the rig's compose service name: rig/docker-compose.yml serves this
+# same certificate there, so the fork's hostname check has to accept it too.
 leaf server localhost \
-  "subjectAltName=DNS:localhost,IP:127.0.0.1
+  "subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:mock-wss
 extendedKeyUsage=serverAuth"
 
 # Deliberately carries neither localhost nor 127.0.0.1, so a client that checks
