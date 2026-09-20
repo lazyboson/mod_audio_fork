@@ -56,11 +56,11 @@ ForkSession::Tuning MakeTuning(bool playback = false) {
   return tuning;
 }
 
-ForkParams MakeParams(std::uint16_t port, std::string fork_id) {
+ForkParams MakeParams(std::uint16_t port, std::string fork_id, bool tls = false) {
   ForkParams params;
   params.call_uuid = "call-e2e";
   params.fork_id = std::move(fork_id);
-  params.endpoint = {"127.0.0.1", port, "/", false};
+  params.endpoint = {"127.0.0.1", port, "/", tls};
   params.format = {16000, 2};
   return params;
 }
@@ -83,9 +83,10 @@ struct PoolFixture {
   std::optional<SlabPool> slabs = SlabPool::Create({4096, std::size_t{4096} * 512});
   std::unique_ptr<ShardPool> pool;
 
-  explicit PoolFixture(std::size_t shard_count = 2) {
+  explicit PoolFixture(std::size_t shard_count = 2, const TlsOptions& tls = {}) {
     ModuleConfig config;
     config.shard_count = shard_count;
+    config.tls = tls;
     pool = ShardPool::Start(config, *slabs);
     EXPECT_NE(pool, nullptr);
   }
@@ -320,6 +321,37 @@ TEST(ShardPool, SendTextAndDtmfReachTheServerFromAnotherThread) {
     return fx.events.Count(ForkEventType::kJson) >= static_cast<std::size_t>(2 * kRounds) + 1U;
   }));
   EXPECT_EQ(session->stats().pending_texts_dropped, 0U);
+
+  session->Stop();
+  ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kDead; }));
+  EXPECT_EQ(fx.slabs->stats().leased_slabs, 0U);
+}
+
+TEST(ShardPool, ForkOverWssStreamsAudioAndText) {
+  TestWsTls server_tls{TestTlsPath("server.pem"), TestTlsPath("server.key"), ""};
+  auto server = TestWsServer::Start(server_tls);
+  ASSERT_NE(server, nullptr);
+
+  TlsOptions tls;
+  tls.ca_file = TestTlsPath("ca.pem");
+  PoolFixture fx(1, tls);
+
+  ForkParams params = MakeParams(server->port(), "fork-wss", true);
+  params.metadata_json = R"({"type":"hello"})";
+  auto session = fx.pool->StartFork(params, MakeTuning(), fx.events, fx.clock);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kConnect) == 1U; }));
+
+  std::vector<std::uint8_t> pcm(1280);
+  std::iota(pcm.begin(), pcm.end(), 0);
+  for (int frame = 0; frame < 10; ++frame) {
+    EXPECT_TRUE(session->PushAudio(ConstByteSpan(pcm)));
+  }
+  ASSERT_TRUE(WaitUntil([&] { return session->stats().sent_bytes >= pcm.size() * 10; }));
+
+  EXPECT_TRUE(session->SendText(R"({"n":1})"));
+  ASSERT_TRUE(WaitUntil([&] { return fx.events.Count(ForkEventType::kJson) >= 2U; }));
+  EXPECT_EQ(fx.events.Count(ForkEventType::kConnectFailed), 0U);
 
   session->Stop();
   ASSERT_TRUE(WaitUntil([&] { return session->state() == SessionState::kDead; }));
