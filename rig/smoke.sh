@@ -146,4 +146,33 @@ playback_sent=$(expect_num playback_bytes_min "report" "$report")
 [ "$playback_sent" -gt 0 ] ||
   fail "server sent no playback audio on some connection: $playback_sent"
 
+MOCK_WSS_URL=${MOCK_WSS_URL:-wss://mock-wss:9443/}
+WSS_REPORT=${MOCK_WSS_REPORT:-/shared/mock-wss-report.json}
+
+echo "forking one call over $MOCK_WSS_URL"
+wss_uuid=$(cli "create_uuid" | tr -d '\r\n ')
+cli "bgapi originate {origination_uuid=$wss_uuid}loopback/rig-tone &echo" >/dev/null
+sleep 3
+out=$(cli "uuid_audio_fork $wss_uuid start $MOCK_WSS_URL mono 16000 {\"rig\":true}")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "wss start rejected for $wss_uuid: $out" ;;
+esac
+sleep "$STREAM_SECONDS"
+cli "uuid_audio_fork $wss_uuid stop" >/dev/null || true
+cli "uuid_kill $wss_uuid" >/dev/null || true
+sleep 3
+
+[ -f "$WSS_REPORT" ] || fail "TLS mock server wrote no report at $WSS_REPORT"
+wss_report=$(cat "$WSS_REPORT")
+echo "wss mock report: $wss_report"
+case "$wss_report" in
+  *'"protocol_errors":[]'*) ;;
+  *) fail "TLS server recorded protocol errors: $wss_report" ;;
+esac
+wss_hellos=$(expect_num hello_count "wss" "$wss_report")
+[ "$wss_hellos" -eq 1 ] || fail "expected 1 hello over wss, got $wss_hellos"
+wss_bytes=$(expect_num audio_bytes "wss" "$wss_report")
+[ "$wss_bytes" -gt 0 ] || fail "no audio reached the TLS server: audio_bytes=$wss_bytes"
+
 echo "SMOKE PASS"
