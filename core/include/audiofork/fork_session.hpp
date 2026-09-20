@@ -97,6 +97,10 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
   // shard, which may still drop it if the queue overflows or the socket refuses.
   [[nodiscard]] bool SendText(std::string text);
   [[nodiscard]] bool SendDtmf(char digit, std::uint32_t duration_ms);
+  // Any thread. Points the fork at another server: the current connection is
+  // said goodbye to and closed, and the reconnect that follows carries the
+  // buffered audio to the new endpoint. False means teardown already started.
+  [[nodiscard]] bool Modify(Endpoint endpoint);
   void set_on_finished(std::function<void()> callback) { on_finished_ = std::move(callback); }
 
   [[nodiscard]] bool PushAudio(ConstByteSpan pcm) noexcept;
@@ -119,6 +123,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
 
  private:
   void Apply(SessionAction action);
+  void ApplyModify(Endpoint endpoint);
   void BeginConnect();
   void BeginDrain();
   void BeginClose();
@@ -170,6 +175,7 @@ class ForkSession : public NetHandler, public std::enable_shared_from_this<ForkS
 
   bool reconnecting_ = false;
   bool dropping_ = false;
+  bool endpoint_changed_ = false;
   bool pool_starved_ = false;
 
   // Flipped from a control thread and read on the media thread. Relaxed on

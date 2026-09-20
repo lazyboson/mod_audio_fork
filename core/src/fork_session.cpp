@@ -136,6 +136,49 @@ bool ForkSession::SendDtmf(char digit, std::uint32_t duration_ms) {
   return SendText(std::move(*encoded));
 }
 
+bool ForkSession::Modify(Endpoint endpoint) {
+  switch (state_.state()) {
+    case SessionState::kConnecting:
+    case SessionState::kActive:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      return false;
+  }
+  // may be called from a control or FreeSWITCH session thread: never touch the
+  // connection here, only hop to the shard
+  auto self = shared_from_this();
+  net_.Post(
+      [self, endpoint = std::move(endpoint)]() mutable { self->ApplyModify(std::move(endpoint)); });
+  return true;
+}
+
+void ForkSession::ApplyModify(Endpoint endpoint) {
+  switch (state_.state()) {
+    case SessionState::kConnecting:
+    case SessionState::kActive:
+    case SessionState::kReconnecting:
+      break;
+    case SessionState::kDraining:
+    case SessionState::kClosing:
+    case SessionState::kDead:
+      return;
+  }
+  params_.endpoint = std::move(endpoint);
+  endpoint_changed_ = true;
+  backoff_.Reset();
+  if (connection_ == nullptr) {
+    return;
+  }
+  (void)connection_->SendText(EncodeBye());
+  connection_->Close();
+  // forgotten now rather than at OnClosed: what is buffered belongs to the new
+  // server, and a flush would otherwise hand it to the socket that is leaving
+  connection_ = nullptr;
+}
+
 void ForkSession::Pump() {
   DrainHandoffRing();
   PumpPlayback();
@@ -258,7 +301,10 @@ void ForkSession::Apply(SessionAction action) {
         Apply(state_.OnEvent(SessionEvent::kWsError).action);
         return;
       }
-      if (reconnecting_) {
+      // A modify points the fork at a server that never saw this stream, so it
+      // gets a plain hello: another server's gap and drop totals would mean
+      // nothing to it.
+      if (reconnecting_ && !endpoint_changed_) {
         const std::uint64_t gap_ms =
             disconnected_at_.has_value()
                 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -275,6 +321,11 @@ void ForkSession::Apply(SessionAction action) {
         reconnects_.fetch_add(1, std::memory_order_relaxed);
       } else {
         Emit(ForkEventType::kConnect);
+      }
+      if (endpoint_changed_) {
+        endpoint_changed_ = false;
+        reconnecting_ = false;
+        dropped_since_resume_ = 0;
       }
       disconnected_at_.reset();
       FlushPendingTexts();

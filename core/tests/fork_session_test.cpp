@@ -66,13 +66,15 @@ class FakeNet : public NetPort {
 
   bool fail_connect = false;
   int connect_calls = 0;
+  std::vector<Endpoint> endpoints;
   std::vector<std::unique_ptr<FakeConnection>> connections;
   std::vector<Timer> timers;
   std::vector<std::function<void()>> posted;
 
-  [[nodiscard]] NetConnection* Connect(const Endpoint& /*endpoint*/, NetHandler& handler,
+  [[nodiscard]] NetConnection* Connect(const Endpoint& endpoint, NetHandler& handler,
                                        std::size_t /*max_queued_bytes*/) override {
     ++connect_calls;
+    endpoints.push_back(endpoint);
     handler_ = &handler;
     if (fail_connect) {
       return nullptr;
@@ -259,6 +261,80 @@ TEST(ForkSession, StalledPeerDropsOldestAndEmitsOneOverrunPerEpisode) {
     fx.session->Pump();
   }
   EXPECT_EQ(fx.events.Count(ForkEventType::kOverrun), 2U);
+}
+
+TEST(ForkSession, ModifyMovesTheForkToANewServerCarryingBufferedAudio) {
+  Fixture fx;
+  fx.Connect();
+  FakeConnection& old_socket = fx.net.live();
+
+  old_socket.accept_sends = false;
+  const auto pending = Frame(640, 7);
+  EXPECT_TRUE(fx.session->PushAudio(ConstByteSpan(pending)));
+  fx.session->Pump();
+  EXPECT_TRUE(old_socket.binary.empty());
+  old_socket.accept_sends = true;
+
+  EXPECT_TRUE(fx.session->Modify(Endpoint{"new-host", 9443, "/v2", true}));
+  fx.net.RunPosted();
+  EXPECT_EQ(json::parse(old_socket.texts.back())["type"], "bye");
+  EXPECT_TRUE(old_socket.closed);
+  EXPECT_TRUE(old_socket.binary.empty());
+
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  ASSERT_EQ(fx.session->state(), SessionState::kReconnecting);
+  ASSERT_TRUE(fx.net.FireOneTimer());
+  EXPECT_EQ(fx.net.endpoints.back().host, "new-host");
+  EXPECT_EQ(fx.net.endpoints.back().port, 9443);
+  EXPECT_TRUE(fx.net.endpoints.back().tls);
+
+  fx.net.handler().OnConnected();
+  EXPECT_EQ(fx.session->state(), SessionState::kActive);
+  ASSERT_EQ(fx.net.live().texts.size(), 1U);
+  EXPECT_EQ(json::parse(fx.net.live().texts[0])["type"], "hello");
+  EXPECT_EQ(fx.events.Count(ForkEventType::kResume), 0U);
+  EXPECT_EQ(fx.events.Count(ForkEventType::kConnect), 2U);
+  EXPECT_EQ(fx.session->stats().reconnects, 0U);
+  EXPECT_EQ(fx.net.live().binary, pending);
+}
+
+TEST(ForkSession, ModifyWhileReconnectingRetargetsTheNextAttempt) {
+  Fixture fx;
+  fx.Connect();
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  ASSERT_EQ(fx.session->state(), SessionState::kReconnecting);
+
+  EXPECT_TRUE(fx.session->Modify(Endpoint{"elsewhere", 8443, "/", true}));
+  fx.net.RunPosted();
+  ASSERT_TRUE(fx.net.FireOneTimer());
+  EXPECT_EQ(fx.net.endpoints.back().host, "elsewhere");
+
+  fx.net.handler().OnConnected();
+  ASSERT_EQ(fx.net.live().texts.size(), 1U);
+  EXPECT_EQ(json::parse(fx.net.live().texts[0])["type"], "hello");
+  EXPECT_EQ(fx.events.Count(ForkEventType::kResume), 0U);
+}
+
+TEST(ForkSession, ModifyAfterTeardownIsRefused) {
+  Fixture fx;
+  fx.Connect();
+  fx.StopAndRun();
+  EXPECT_FALSE(fx.session->Modify(Endpoint{"nowhere", 80, "/", false}));
+  EXPECT_EQ(fx.net.endpoints.size(), 1U);
+}
+
+TEST(ForkSession, ModifyWhoseHopLandsAfterTeardownIsIgnored) {
+  Fixture fx;
+  fx.Connect();
+  fx.session->Stop();
+  // the teardown is queued but has not run, so the endpoint check still passes
+  EXPECT_TRUE(fx.session->Modify(Endpoint{"too-late", 80, "/", false}));
+  fx.net.RunPosted();
+
+  EXPECT_EQ(fx.session->state(), SessionState::kClosing);
+  fx.net.handler().OnClosed(/*connect_failed=*/false);
+  EXPECT_EQ(fx.session->state(), SessionState::kDead);
+  EXPECT_EQ(fx.net.endpoints.size(), 1U);
 }
 
 TEST(ForkSession, PausedAudioIsDiscardedWithoutCountingAsAMediaDrop) {

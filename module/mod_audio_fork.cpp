@@ -588,6 +588,28 @@ switch_status_t SetForksPaused(switch_core_session_t* session, bool paused, std:
   return SWITCH_STATUS_SUCCESS;
 }
 
+switch_status_t ModifyForks(switch_core_session_t* session, const char* url, std::string& error) {
+  Endpoint endpoint;
+  if (!ParseEndpoint(url, endpoint, error)) {
+    return SWITCH_STATUS_FALSE;
+  }
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
+  }
+  bool applied = false;
+  for (const auto& fork : forks) {
+    applied = fork->Modify(endpoint) || applied;
+  }
+  if (!applied) {
+    error = "fork is stopping";
+    return SWITCH_STATUS_FALSE;
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
 // switch_separate_string cuts the JSON payload at its first space, so the
 // payload is read from the untouched command line instead of from argv.
 const char* SendTextPayload(const char* cmd) {
@@ -641,7 +663,7 @@ SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shu
 
 #define AUDIO_FORK_API_SYNTAX                                                   \
   "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> " \
-  "send_text <json> | <uuid> pause | <uuid> resume"
+  "send_text <json> | <uuid> pause | <uuid> resume | <uuid> modify <wss-url>"
 
 SWITCH_STANDARD_API(uuid_audio_fork_api) {
   (void)session;
@@ -676,6 +698,8 @@ SWITCH_STANDARD_API(uuid_audio_fork_api) {
     if (status != SWITCH_STATUS_SUCCESS) {
       error = "no fork running on this channel";
     }
+  } else if (!strcasecmp(argv[1], "modify")) {
+    status = ModifyForks(target, argc > 2 ? argv[2] : nullptr, error);
   } else if (!strcasecmp(argv[1], "pause")) {
     status = SetForksPaused(target, true, error);
   } else if (!strcasecmp(argv[1], "resume")) {
@@ -777,6 +801,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load) {
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid stop");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid pause");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid resume");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid modify");
 
   g_state = state.release();
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
