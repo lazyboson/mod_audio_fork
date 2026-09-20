@@ -46,16 +46,48 @@ a playback media bug (DESIGN.md §13).
 uuid_audio_fork <uuid> start ws[s]://host[:port]/path <mono|mixed|stereo> <rate> [metadata-json]
 uuid_audio_fork <uuid> stop
 uuid_audio_fork <uuid> send_text <json>
-audio_fork status          # JSON counters: forks, bytes, drops, reconnects, pool use
+uuid_audio_fork <uuid> pause
+uuid_audio_fork <uuid> resume
+uuid_audio_fork <uuid> modify ws[s]://host[:port]/path
+audio_fork status          # JSON counters, see below
 ```
+
+Every verb applies to all forks on the channel and answers `-ERR no fork
+running on this channel` when there are none.
 
 `send_text` takes everything after the verb as its payload, so the JSON may
 contain spaces; it is validated as JSON and then relayed to every fork on the
 channel byte for byte. Text sent before the socket is up is queued (64
 messages, drop-oldest) and flushed straight after the `hello`.
 
+`pause` stops the outbound audio at the media thread and `resume` starts it
+again; both are idempotent. The socket stays connected and the server is told
+nothing — there is no pause message in the wire protocol — and playback from
+the server keeps reaching the caller throughout.
+
+`modify` repoints a live fork at a different server: the current one gets a
+`bye` and a graceful close, and the fork reconnects to the new URL carrying
+whatever audio it had buffered. The new server receives a `hello` and no
+`resume`, because it never saw the stream those gap and drop totals describe.
+
 Caller DTMF is forwarded automatically — no command needed — to every fork on
 the channel as `{"type":"dtmf","digit":"5","durationMs":160}`.
+
+`audio_fork status` answers one JSON object: `calls`, `forks`, `shards` and
+`shard_load` (forks per shard); the outbound counters `sent_bytes`,
+`media_dropped_bytes`, `buffer_dropped_bytes`, `buffered_bytes` and
+`buffered_bytes_max` (the deepest single fork); the playback counters
+`playback_bytes_played`, `playback_bytes_dropped`, `playback_buffered_bytes`
+and `playback_buffered_bytes_max`; `reconnects`, `barge_ins` and
+`pending_texts_dropped`; the overload counters `degraded_forks`,
+`paused_forks` and `start_failed`; and the pool gauges `pool_allocated_bytes`,
+`pool_leased_slabs`, `pool_cap_bytes` and `pool_slab_bytes`.
+
+When the global slab pool is exhausted, a new fork is refused with `-ERR
+global memory cap reached` and a `start_failed` event, and forks that are
+still buffering cut back to `emergency-buffer-seconds` of audio, fire
+`degraded` once for the episode, and return to the full send buffer once the
+pool recovers and their buffer drains.
 
 ## TLS
 
@@ -75,8 +107,8 @@ failed handshake surfaces exactly like a refused connection: a `connect_failed`
 event followed by the usual reconnect backoff.
 
 Events are fired as custom events with subclass `mod_audio_fork::<name>`
-(`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`,
-`playback_start`, `playback_cleared`, `mark`, …).
+(`connect`, `reconnecting`, `resume`, `overrun`, `degraded`, `start_failed`,
+`json`, `stop`, `playback_start`, `playback_cleared`, `mark`, …).
 
 The server drives playback over the same socket: binary frames are PCM to put in
 the caller's ear, `{"type":"clear"}` is barge-in (flushes buffered audio and

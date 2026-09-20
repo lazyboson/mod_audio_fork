@@ -726,12 +726,18 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
   (void)session;
   std::size_t calls = 0;
   std::size_t forks = 0;
+  std::size_t degraded_forks = 0;
+  std::size_t paused_forks = 0;
   std::uint64_t media_dropped = 0;
   std::uint64_t buffer_dropped = 0;
   std::uint64_t sent = 0;
   std::uint64_t reconnects = 0;
   std::size_t buffered = 0;
+  std::size_t buffered_max = 0;
   std::uint64_t playback_played = 0;
+  std::uint64_t playback_dropped = 0;
+  std::size_t playback_buffered = 0;
+  std::size_t playback_buffered_max = 0;
   std::uint64_t barge_ins = 0;
   std::uint64_t texts_dropped = 0;
   {
@@ -746,28 +752,45 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
         sent += stats.sent_bytes;
         reconnects += stats.reconnects;
         buffered += stats.buffered_bytes;
+        buffered_max = std::max(buffered_max, stats.buffered_bytes);
         playback_played += stats.playback_bytes_played;
+        playback_dropped += stats.playback_bytes_dropped;
+        playback_buffered += stats.playback_buffered_bytes;
+        playback_buffered_max = std::max(playback_buffered_max, stats.playback_buffered_bytes);
         barge_ins += stats.barge_ins;
         texts_dropped += stats.pending_texts_dropped;
+        degraded_forks += static_cast<std::size_t>(stats.degraded);
+        paused_forks += static_cast<std::size_t>(stats.paused);
       }
     }
   }
   const SlabPool::Stats pool = g_state->pool->stats();
-  stream->write_function(
-      stream,
-      "{\"calls\":%lu,\"forks\":%lu,\"shards\":%lu,\"sent_bytes\":%llu,"
-      "\"media_dropped_bytes\":%llu,\"buffer_dropped_bytes\":%llu,\"reconnects\":%llu,"
-      "\"buffered_bytes\":%lu,\"playback_bytes_played\":%llu,\"barge_ins\":%llu,"
-      "\"pending_texts_dropped\":%llu,"
-      "\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
-      static_cast<unsigned long>(calls), static_cast<unsigned long>(forks),
-      static_cast<unsigned long>(g_state->shards->shard_count()),
-      static_cast<unsigned long long>(sent), static_cast<unsigned long long>(media_dropped),
-      static_cast<unsigned long long>(buffer_dropped), static_cast<unsigned long long>(reconnects),
-      static_cast<unsigned long>(buffered), static_cast<unsigned long long>(playback_played),
-      static_cast<unsigned long long>(barge_ins), static_cast<unsigned long long>(texts_dropped),
-      static_cast<unsigned long>(pool.allocated_bytes),
-      static_cast<unsigned long>(pool.leased_slabs));
+  const nlohmann::ordered_json status{
+      {"calls", calls},
+      {"forks", forks},
+      {"shards", g_state->shards->shard_count()},
+      {"sent_bytes", sent},
+      {"media_dropped_bytes", media_dropped},
+      {"buffer_dropped_bytes", buffer_dropped},
+      {"reconnects", reconnects},
+      {"buffered_bytes", buffered},
+      {"buffered_bytes_max", buffered_max},
+      {"playback_bytes_played", playback_played},
+      {"playback_bytes_dropped", playback_dropped},
+      {"playback_buffered_bytes", playback_buffered},
+      {"playback_buffered_bytes_max", playback_buffered_max},
+      {"barge_ins", barge_ins},
+      {"pending_texts_dropped", texts_dropped},
+      {"degraded_forks", degraded_forks},
+      {"paused_forks", paused_forks},
+      {"start_failed", g_state->start_failed.load(std::memory_order_relaxed)},
+      {"pool_allocated_bytes", pool.allocated_bytes},
+      {"pool_leased_slabs", pool.leased_slabs},
+      {"pool_cap_bytes", pool.cap_bytes},
+      {"pool_slab_bytes", pool.slab_size_bytes},
+      {"shard_load", g_state->shards->shard_loads()},
+  };
+  stream->write_function(stream, "%s\n", status.dump().c_str());
   return SWITCH_STATUS_SUCCESS;
 }
 

@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -96,6 +97,35 @@ TEST(ShardPool, StartsRequestedShardCount) {
   PoolFixture fx(3);
   EXPECT_EQ(fx.pool->shard_count(), 3U);
   EXPECT_EQ(fx.pool->active_forks(), 0U);
+}
+
+TEST(ShardPool, ShardLoadsReportOneEntryPerShardAndSumToTheActiveForks) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  PoolFixture fx(3);
+  EXPECT_EQ(fx.pool->shard_loads(), std::vector<std::size_t>(3, 0U));
+
+  constexpr int kForks = 6;
+  std::vector<std::shared_ptr<ForkSession>> sessions;
+  for (int i = 0; i < kForks; ++i) {
+    auto session = fx.pool->StartFork(MakeParams(server->port(), "load-" + std::to_string(i)),
+                                      MakeTuning(), fx.events, fx.clock);
+    ASSERT_NE(session, nullptr);
+    sessions.push_back(std::move(session));
+  }
+  ASSERT_TRUE(WaitUntil([&] { return fx.pool->active_forks() == kForks; }));
+
+  const std::vector<std::size_t> loads = fx.pool->shard_loads();
+  ASSERT_EQ(loads.size(), 3U);
+  EXPECT_EQ(std::accumulate(loads.begin(), loads.end(), std::size_t{0}), fx.pool->active_forks());
+  // least-loaded placement, so no shard may carry more than its even share
+  EXPECT_EQ(*std::max_element(loads.begin(), loads.end()), kForks / 3);
+
+  for (auto& session : sessions) {
+    session->Stop();
+  }
+  ASSERT_TRUE(WaitUntil([&] { return fx.pool->active_forks() == 0U; }));
+  EXPECT_EQ(fx.pool->shard_loads(), std::vector<std::size_t>(3, 0U));
 }
 
 TEST(ShardPool, ForkStreamsAudioThroughRealSocketsAndTearsDownCleanly) {

@@ -171,6 +171,15 @@ std::size_t ShardPool::active_forks() const {
   return total;
 }
 
+std::vector<std::size_t> ShardPool::shard_loads() const {
+  std::vector<std::size_t> loads;
+  loads.reserve(shards_.size());
+  for (const auto& shard : shards_) {
+    loads.push_back(shard->load());
+  }
+  return loads;
+}
+
 Shard& ShardPool::LeastLoadedShard() {
   auto it =
       std::min_element(shards_.begin(), shards_.end(),
