@@ -21,6 +21,10 @@ MEAN_ABS_MIN=1000
 
 cli() { "$FS_CLI" -H 127.0.0.1 -x "$1"; }
 
+# run_smoke.sh judges the FreeSWITCH container's exit code, so FreeSWITCH has
+# to be asked to shut down on every exit from here, pass or fail
+trap 'cli "fsctl shutdown" >/dev/null 2>&1 || true' EXIT
+
 fail() {
   echo "SMOKE FAIL: $1" >&2
   exit 1

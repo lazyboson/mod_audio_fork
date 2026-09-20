@@ -46,10 +46,13 @@ fixed total would either tolerate too loosely or fail on spuriously.
 ## Running the smoke locally
 
 ```sh
-docker compose -f rig/docker-compose.yml up --build \
-  --abort-on-container-exit --exit-code-from smoke
-docker compose -f rig/docker-compose.yml down -v
+./rig/run_smoke.sh
 ```
+
+`run_smoke.sh` is the only entry point, used by CI too. It brings the compose
+stack up, waits for the smoke to finish, waits for FreeSWITCH to exit (the
+smoke's last act is `fsctl shutdown`), asserts both exit codes are 0, writes
+the full rig logs to `rig-logs.txt`, and tears the stack down with `down -v`.
 
 | Knob | Where | Default | Effect |
 |---|---|---|---|
@@ -63,7 +66,10 @@ docker compose -f rig/docker-compose.yml down -v
 
 ## Known gaps the rig found
 
-- FreeSWITCH exits 139 on shutdown once a fork has run in the process, whether
-  or not the fork was stopped first. Loading the module without starting a
-  fork, and placing a rig call without forking it, both shut down cleanly. It
-  does not affect the smoke's exit code (`--exit-code-from smoke`).
+- FreeSWITCH 1.10.12 on musl SIGSEGVs at shutdown once any session in the
+  process has carried an `SMBF_WRITE_REPLACE` media bug — the playback path's
+  bug, but equally stock `uuid_displace` with `mod_audio_fork` not loaded at
+  all. The fault is in `switch_core_session_thread_pool_worker` destroying its
+  own memory pool, so the rig sets `session-thread-pool=false`, which gives
+  every session its own thread and removes the faulting path. `run_smoke.sh`
+  asserts the FreeSWITCH exit code so a regression cannot pass unnoticed.
