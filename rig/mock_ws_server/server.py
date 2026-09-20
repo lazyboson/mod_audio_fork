@@ -9,13 +9,17 @@ script scenarios without editing code.
   MOCK_WS_PORT        listen port (default 9099)
   MOCK_WS_STALL_AFTER stop reading after N binary frames (exercises backpressure)
   MOCK_WS_DROP_AFTER  close the connection after N binary frames
+  MOCK_WS_PLAYBACK_MS after hello, stream N ms of 16 kHz mono L16 tone back at
+                      real-time pace, then a "rig-end" mark
   MOCK_WS_REPORT      path to write a JSON report per connection
 """
 from __future__ import annotations
 
+import array
 import base64
 import hashlib
 import json
+import math
 import os
 import socket
 import struct
@@ -29,6 +33,11 @@ OPCODE_BINARY = 0x2
 OPCODE_CLOSE = 0x8
 OPCODE_PING = 0x9
 OPCODE_PONG = 0xA
+
+PLAYBACK_RATE = 16000
+PLAYBACK_CHUNK_MS = 20
+PLAYBACK_TONE_HZ = 400
+PLAYBACK_AMPLITUDE = 12000
 
 
 def _recv_exact(conn: socket.socket, count: int) -> bytes:
@@ -96,6 +105,31 @@ def _send_frame(conn: socket.socket, opcode: int, payload: bytes = b"") -> None:
     conn.sendall(bytes(header) + payload)
 
 
+def _tone_chunk() -> bytes:
+    # 400 Hz at 16 kHz is 40 samples per period and 320 samples per 20 ms chunk,
+    # so repeating one chunk is a continuous tone with no phase discontinuity.
+    samples = PLAYBACK_RATE * PLAYBACK_CHUNK_MS // 1000
+    pcm = array.array(
+        "h",
+        (
+            int(PLAYBACK_AMPLITUDE * math.sin(2 * math.pi * PLAYBACK_TONE_HZ * i / PLAYBACK_RATE))
+            for i in range(samples)
+        ),
+    )
+    return pcm.tobytes()
+
+
+TONE_CHUNK = _tone_chunk()
+
+
+def _min_of(values: list[int]) -> int:
+    return min(values) if values else 0
+
+
+def _max_of(values: list[int]) -> int:
+    return max(values) if values else 0
+
+
 class Report:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -105,11 +139,44 @@ class Report:
         self.bye_count = 0
         self.audio_bytes = 0
         self.audio_frames = 0
+        self.playback_bytes_sent = 0
         self.protocol_errors: list[str] = []
         self.first_hello: dict | None = None
+        self.per_connection: list[dict] = []
+
+    def new_connection(self) -> dict:
+        stats = {
+            "audio_bytes": 0,
+            "first_frame_bytes": 0,
+            "first_frame_ms": 0,
+            "last_frame_ms": 0,
+            "abs_sum": 0,
+            "sample_count": 0,
+            "playback_bytes": 0,
+        }
+        with self.lock:
+            self.connections += 1
+            self.per_connection.append(stats)
+        return stats
 
     def snapshot(self) -> dict:
         with self.lock:
+            audio_bytes = [c["audio_bytes"] for c in self.per_connection]
+            playback_bytes = [c["playback_bytes"] for c in self.per_connection]
+            spans = [c["last_frame_ms"] - c["first_frame_ms"] for c in self.per_connection]
+            # The first frame is however much the module had coalesced when the
+            # connection opened, so it is excluded from the rate it defines.
+            rates = [
+                (c["audio_bytes"] - c["first_frame_bytes"]) * 1000
+                // (c["last_frame_ms"] - c["first_frame_ms"])
+                for c in self.per_connection
+                if c["last_frame_ms"] > c["first_frame_ms"]
+            ]
+            mean_abs = [
+                c["abs_sum"] // c["sample_count"]
+                for c in self.per_connection
+                if c["sample_count"] > 0
+            ]
             return {
                 "connections": self.connections,
                 "hello_count": self.hello_count,
@@ -117,6 +184,15 @@ class Report:
                 "bye_count": self.bye_count,
                 "audio_bytes": self.audio_bytes,
                 "audio_frames": self.audio_frames,
+                "audio_bytes_min": _min_of(audio_bytes),
+                "audio_bytes_max": _max_of(audio_bytes),
+                "audio_span_ms_min": _min_of(spans),
+                "audio_rate_min": _min_of(rates),
+                "audio_rate_max": _max_of(rates),
+                "audio_mean_abs_min": _min_of(mean_abs),
+                "audio_mean_abs_max": _max_of(mean_abs),
+                "playback_bytes_sent": self.playback_bytes_sent,
+                "playback_bytes_min": _min_of(playback_bytes),
                 "protocol_errors": list(self.protocol_errors),
                 "first_hello": self.first_hello,
             }
@@ -125,23 +201,66 @@ class Report:
 REPORT = Report()
 STALL_AFTER = int(os.environ.get("MOCK_WS_STALL_AFTER", "0"))
 DROP_AFTER = int(os.environ.get("MOCK_WS_DROP_AFTER", "0"))
+PLAYBACK_MS = int(os.environ.get("MOCK_WS_PLAYBACK_MS", "0"))
 REPORT_PATH = os.environ.get("MOCK_WS_REPORT", "")
+REPORT_WRITE_LOCK = threading.Lock()
+
+
+def _write_report() -> None:
+    if not REPORT_PATH:
+        return
+    payload = json.dumps(REPORT.snapshot(), separators=(",", ":"))
+    temp = REPORT_PATH + ".tmp"
+    # Connections close together at teardown, so the write is serialized and
+    # renamed into place: a half-written report would fail the smoke spuriously.
+    with REPORT_WRITE_LOCK:
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(temp, REPORT_PATH)
+
+
+def _play(conn: socket.socket, send_lock: threading.Lock, stats: dict, stop: threading.Event) -> None:
+    deadline = time.monotonic()
+    try:
+        for _ in range(PLAYBACK_MS // PLAYBACK_CHUNK_MS):
+            if stop.is_set():
+                return
+            with send_lock:
+                _send_frame(conn, OPCODE_BINARY, TONE_CHUNK)
+            with REPORT.lock:
+                stats["playback_bytes"] += len(TONE_CHUNK)
+                REPORT.playback_bytes_sent += len(TONE_CHUNK)
+            deadline += PLAYBACK_CHUNK_MS / 1000
+            time.sleep(max(0.0, deadline - time.monotonic()))
+        if stop.is_set():
+            return
+        with send_lock:
+            _send_frame(
+                conn,
+                OPCODE_TEXT,
+                json.dumps({"type": "mark", "name": "rig-end"}).encode("utf-8"),
+            )
+    except (ConnectionError, socket.timeout, OSError):
+        return
 
 
 def _handle(conn: socket.socket) -> None:
     conn.settimeout(30)
     frames = 0
     saw_hello = False
+    send_lock = threading.Lock()
+    stop = threading.Event()
+    stats = None
     try:
         _handshake(conn)
-        with REPORT.lock:
-            REPORT.connections += 1
+        stats = REPORT.new_connection()
         while True:
             opcode, payload = _read_frame(conn)
             if opcode == OPCODE_CLOSE:
                 return
             if opcode == OPCODE_PING:
-                _send_frame(conn, OPCODE_PONG, payload)
+                with send_lock:
+                    _send_frame(conn, OPCODE_PONG, payload)
                 continue
             if opcode == OPCODE_TEXT:
                 try:
@@ -164,9 +283,16 @@ def _handle(conn: socket.socket) -> None:
                         REPORT.resume_count += 1
                     elif kind == "bye":
                         REPORT.bye_count += 1
+                if kind == "hello" and PLAYBACK_MS > 0:
+                    threading.Thread(
+                        target=_play, args=(conn, send_lock, stats, stop), daemon=True
+                    ).start()
                 continue
             if opcode == OPCODE_BINARY:
                 frames += 1
+                now_ms = int(time.monotonic() * 1000)
+                samples = array.array("h")
+                samples.frombytes(payload[: len(payload) - len(payload) % 2])
                 with REPORT.lock:
                     if not saw_hello:
                         REPORT.protocol_errors.append("audio arrived before hello")
@@ -174,6 +300,13 @@ def _handle(conn: socket.socket) -> None:
                     REPORT.audio_frames += 1
                     if len(payload) % 2 != 0:
                         REPORT.protocol_errors.append("audio frame is not 16-bit aligned")
+                    stats["audio_bytes"] += len(payload)
+                    stats["abs_sum"] += sum(map(abs, samples))
+                    stats["sample_count"] += len(samples)
+                    if frames == 1:
+                        stats["first_frame_bytes"] = len(payload)
+                        stats["first_frame_ms"] = now_ms
+                    stats["last_frame_ms"] = now_ms
                 if DROP_AFTER and frames >= DROP_AFTER:
                     return
                 if STALL_AFTER and frames >= STALL_AFTER:
@@ -183,13 +316,13 @@ def _handle(conn: socket.socket) -> None:
     except (ConnectionError, socket.timeout, OSError):
         return
     finally:
+        stop.set()
         try:
             conn.close()
         except OSError:
             pass
-        if REPORT_PATH:
-            with open(REPORT_PATH, "w", encoding="utf-8") as handle:
-                json.dump(REPORT.snapshot(), handle)
+        if stats is not None:
+            _write_report()
 
 
 def main() -> int:
