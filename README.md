@@ -40,8 +40,17 @@ directory and `conf/audio_fork.conf.xml` into `conf/autoload_configs/`.
 ```
 uuid_audio_fork <uuid> start ws://host:port/path <mono|mixed|stereo> <rate> [metadata-json]
 uuid_audio_fork <uuid> stop
+uuid_audio_fork <uuid> send_text <json>
 audio_fork status          # JSON counters: forks, bytes, drops, reconnects, pool use
 ```
+
+`send_text` takes everything after the verb as its payload, so the JSON may
+contain spaces; it is validated as JSON and then relayed to every fork on the
+channel byte for byte. Text sent before the socket is up is queued (64
+messages, drop-oldest) and flushed straight after the `hello`.
+
+Caller DTMF is forwarded automatically — no command needed — to every fork on
+the channel as `{"type":"dtmf","digit":"5","durationMs":160}`.
 
 Events are fired as custom events with subclass `mod_audio_fork::<name>`
 (`connect`, `reconnecting`, `resume`, `overrun`, `json`, `stop`,
@@ -60,8 +69,9 @@ mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback
   wire-protocol codec with libFuzzer harness, jittered reconnect backoff,
   echo/reconnect integration tests against an in-process mock WS server.
 - M3 (module shell + fork path) — **partially complete.** The fork path,
-  sharded runtime, and drachtio-compatible command surface are implemented and
-  covered by 100 tests green under ASan/UBSan and TSan.
+  sharded runtime, and the full drachtio-compatible command surface (`start`,
+  `stop`, `send_text`, `audio_fork status`) plus automatic DTMF forwarding are
+  implemented and covered by tests green under ASan/UBSan and TSan.
 
   Verified against a real FreeSWITCH 1.10.12: the module compiles against its
   headers, loads and unloads cleanly, reads `audio_fork.conf.xml`, and answers
@@ -72,7 +82,8 @@ mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback
   this yet — see the banner above.
 - M4 (playback) — **implemented, same verification gap as M3.** Jitter buffer,
   WRITE_REPLACE injection with rate conversion, watermark flow control, and
-  `clear`/`mark` barge-in. 127 tests green under both sanitizers, including
-  byte-exact playback and barge-in over real sockets. Playback has never been
-  heard on a live call — that needs the rig.
+  `clear`/`mark` barge-in. 139 tests green under both sanitizers, including
+  byte-exact playback, barge-in, and app-text/DTMF passthrough over real
+  sockets. Playback has never been heard on a live call, and no DTMF digit has
+  ever been forwarded from one — that needs the rig.
 - M5 (chaos + soak) — not started: rig completion, nightly load tier, 48h gate.
