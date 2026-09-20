@@ -40,6 +40,9 @@ class TestWsServer {
   // "text:<payload>", "binary:<byte count>", and "close" when the peer sent a
   // close frame. A peer that resets the socket instead never adds "close".
   [[nodiscard]] std::vector<std::string> transcript() const;
+  // Every connection established from now on completes the handshake and then
+  // never reads, so a client's send queue cannot drain.
+  void StopReadingNewConnections();
   void CloseAllConnections();
 
   [[nodiscard]] int HandleLws(lws* wsi, int reason, void* in, std::size_t len);
@@ -58,6 +61,7 @@ class TestWsServer {
   std::uint16_t port_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int> total_connections_{0};
+  std::atomic<bool> stop_reading_{false};
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;
   mutable std::mutex transcript_mutex_;

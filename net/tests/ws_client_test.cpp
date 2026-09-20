@@ -62,10 +62,11 @@ struct RecordingHandler : WsConnectionHandler {
 };
 
 struct LoopRunner {
-  std::unique_ptr<WsEventLoop> loop = WsEventLoop::Create();
+  std::unique_ptr<WsEventLoop> loop;
   std::thread thread;
 
-  LoopRunner() {
+  explicit LoopRunner(std::chrono::milliseconds close_drain_timeout = 5000ms)
+      : loop(WsEventLoop::Create(close_drain_timeout)) {
     EXPECT_NE(loop, nullptr);
     thread = std::thread([this] { loop->Run(); });
   }
@@ -376,6 +377,41 @@ TEST(WsClient, CloseBeforeEstablishedDeliversOneConnectFailure) {
   EXPECT_FALSE(handler.connected);
   EXPECT_FALSE(handler.WaitFor([&] { return handler.close_count > 1; }, 500ms));
   EXPECT_EQ(handler.close_count, 1);
+}
+
+TEST(WsClient, CloseIsBoundedWhenThePeerStopsReading) {
+  auto server = TestWsServer::Start();
+  ASSERT_NE(server, nullptr);
+  server->StopReadingNewConnections();
+
+  struct StalledHandler : RecordingHandler {
+    WsConnection* self = nullptr;
+    int queued = 0;
+    void OnConnected() override {
+      const std::vector<std::uint8_t> chunk(std::size_t{64} * 1024, 0xAB);
+      while (self->SendBinary(ConstByteSpan(chunk))) {
+        ++queued;
+      }
+      self->Close();
+      // last: publishes the flags-before-connected ordering WaitFor relies on
+      RecordingHandler::OnConnected();
+    }
+  };
+  StalledHandler sender;
+  LoopRunner runner{200ms};
+  runner.loop->Post([&] {
+    sender.self = runner.loop->Connect({"127.0.0.1", server->port(), "/"}, sender,
+                                       /*max_queued_bytes=*/std::size_t{4} * 1024 * 1024);
+    ASSERT_NE(sender.self, nullptr);
+  });
+
+  ASSERT_TRUE(sender.WaitFor([&] { return sender.closed; }, 10s));
+  EXPECT_FALSE(sender.connect_failed);
+  EXPECT_FALSE(sender.WaitFor([&] { return sender.close_count > 1; }, 500ms));
+  EXPECT_EQ(sender.close_count, 1);
+  // the peer never read, so the queue the handler filled cannot have drained
+  EXPECT_GT(sender.queued, 1);
+  EXPECT_LT(server->transcript().size(), static_cast<std::size_t>(sender.queued));
 }
 
 }  // namespace

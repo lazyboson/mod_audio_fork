@@ -1,6 +1,7 @@
 #include "test_ws_server.hpp"
 
 #include <libwebsockets.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <string>
@@ -84,6 +85,8 @@ void TestWsServer::Broadcast(std::string payload, bool binary) {
   });
 }
 
+void TestWsServer::StopReadingNewConnections() { stop_reading_.store(true); }
+
 void TestWsServer::CloseAllConnections() {
   Post([this] {
     for (auto& [wsi, state] : connections_) {
@@ -130,6 +133,14 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
     case LWS_CALLBACK_ESTABLISHED:
       connections_[wsi] = PerConnection{};
       total_connections_.fetch_add(1);
+      if (stop_reading_.load()) {
+        // lws stops draining the socket; the small receive buffer is what makes
+        // the peer's send queue block after a few KB instead of a few hundred
+        const int receive_bytes = 2048;
+        (void)setsockopt(lws_get_socket_fd(wsi), SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                         sizeof(receive_bytes));
+        (void)lws_rx_flow_control(wsi, 0);
+      }
       return 0;
 
     case LWS_CALLBACK_RECEIVE: {

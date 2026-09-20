@@ -12,7 +12,6 @@ namespace {
 
 constexpr const char* kProtocolName = "audiofork";
 constexpr std::size_t kRxBufferBytes = std::size_t{64} * 1024;
-constexpr int kCloseDrainTimeoutSeconds = 5;
 
 int RawLwsCallback(lws* wsi, lws_callback_reasons reason, void* user, void* in, std::size_t len) {
   auto* loop = static_cast<WsEventLoop*>(lws_context_user(lws_get_context(wsi)));
@@ -77,8 +76,11 @@ void EnsureLwsLogPolicy() {
   (void)configured;
 }
 
-WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes)
-    : handler_(handler), max_queued_bytes_(max_queued_bytes) {}
+WsConnection::WsConnection(PrivateTag, WsConnectionHandler& handler, std::size_t max_queued_bytes,
+                           std::chrono::milliseconds close_drain_timeout)
+    : handler_(handler),
+      max_queued_bytes_(max_queued_bytes),
+      close_drain_timeout_(close_drain_timeout) {}
 
 bool WsConnection::SendText(std::string_view text) {
   return Enqueue(ConstByteSpan(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()),
@@ -103,7 +105,8 @@ void WsConnection::Close() {
   if (wsi_ != nullptr && established_) {
     // a peer that stops reading would otherwise pin the socket for as long as
     // it stays silent: lws force-closes the wsi when this expires
-    lws_set_timeout(wsi_, PENDING_TIMEOUT_CLOSE_SEND, kCloseDrainTimeoutSeconds);
+    lws_set_timeout_us(wsi_, PENDING_TIMEOUT_CLOSE_SEND,
+                       static_cast<lws_usec_t>(close_drain_timeout_.count()) * LWS_US_PER_MS);
     lws_callback_on_writable(wsi_);
   } else if (wsi_ != nullptr) {
     // connect still in flight: force lws to give up on it now
@@ -128,9 +131,10 @@ bool WsConnection::Enqueue(ConstByteSpan bytes, bool binary) {
   return true;
 }
 
-std::unique_ptr<WsEventLoop> WsEventLoop::Create() {
+std::unique_ptr<WsEventLoop> WsEventLoop::Create(std::chrono::milliseconds close_drain_timeout) {
   EnsureLwsLogPolicy();
   auto loop = std::make_unique<WsEventLoop>(PrivateTag{});
+  loop->close_drain_timeout_ = close_drain_timeout;
   lws_context_creation_info info{};
   info.port = CONTEXT_PORT_NO_LISTEN;
   info.protocols = kProtocols.data();
@@ -215,8 +219,8 @@ void WsEventLoop::Post(std::function<void()> task) {
 
 WsConnection* WsEventLoop::Connect(const WsEndpoint& endpoint, WsConnectionHandler& handler,
                                    std::size_t max_queued_bytes) {
-  auto owned =
-      std::make_unique<WsConnection>(WsConnection::PrivateTag{}, handler, max_queued_bytes);
+  auto owned = std::make_unique<WsConnection>(WsConnection::PrivateTag{}, handler, max_queued_bytes,
+                                              close_drain_timeout_);
   WsConnection* connection = owned.get();
 
   lws_client_connect_info info{};
