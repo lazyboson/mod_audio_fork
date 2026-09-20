@@ -144,6 +144,8 @@ class Report:
         self.audio_frames = 0
         self.playback_bytes_sent = 0
         self.protocol_errors: list[str] = []
+        self.hello_sids: list[str] = []
+        self.bye_sids: list[str] = []
         self.first_hello: dict | None = None
         self.per_connection: list[dict] = []
 
@@ -197,6 +199,8 @@ class Report:
                 "playback_bytes_sent": self.playback_bytes_sent,
                 "playback_bytes_min": _min_of(playback_bytes),
                 "protocol_errors": list(self.protocol_errors),
+                "hellos": list(self.hello_sids),
+                "byes": list(self.bye_sids),
                 "first_hello": self.first_hello,
             }
 
@@ -253,6 +257,7 @@ def _handle(conn: socket.socket, tls: ssl.SSLContext | None) -> None:
     conn.settimeout(30)
     frames = 0
     saw_hello = False
+    call_sid = ""
     send_lock = threading.Lock()
     stop = threading.Event()
     stats = None
@@ -281,6 +286,8 @@ def _handle(conn: socket.socket, tls: ssl.SSLContext | None) -> None:
                     if kind == "hello":
                         REPORT.hello_count += 1
                         saw_hello = True
+                        call_sid = str(message.get("callSid", ""))
+                        REPORT.hello_sids.append(call_sid)
                         if REPORT.first_hello is None:
                             REPORT.first_hello = message
                         for field in ("version", "callSid", "rate", "channels", "encoding"):
@@ -290,6 +297,8 @@ def _handle(conn: socket.socket, tls: ssl.SSLContext | None) -> None:
                         REPORT.resume_count += 1
                     elif kind == "bye":
                         REPORT.bye_count += 1
+                        # attributed to the connection's hello: bye carries no id
+                        REPORT.bye_sids.append(call_sid)
                 if kind == "hello" and PLAYBACK_MS > 0:
                     threading.Thread(
                         target=_play, args=(conn, send_lock, stats, stop), daemon=True

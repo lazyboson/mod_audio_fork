@@ -190,4 +190,82 @@ wss_hellos=$(expect_num hello_count "wss" "$wss_report")
 wss_bytes=$(expect_num audio_bytes "wss" "$wss_report")
 [ "$wss_bytes" -gt 0 ] || fail "no audio reached the TLS server: audio_bytes=$wss_bytes"
 
+# pause / resume / modify, last and on a call of their own: the counter
+# assertions above are written against the forks they set up themselves.
+sid_list() { printf '%s' "$2" | sed -n "s/.*\"$1\":\\[\\([^]]*\\)\\].*/\\1/p"; }
+
+i=0
+while [ "$i" -lt 15 ]; do
+  idle=$(field forks "$(cli "audio_fork status")")
+  if [ "${idle:-1}" -eq 0 ]; then break; fi
+  i=$((i + 1))
+  sleep 1
+done
+[ "${idle:-1}" -eq 0 ] || fail "forks from the earlier blocks never retired: $idle"
+
+echo "exercising pause, resume and modify"
+verb_uuid=$(cli "create_uuid" | tr -d '\r\n ')
+cli "bgapi originate {origination_uuid=$verb_uuid}loopback/rig-tone &echo" >/dev/null
+sleep 3
+out=$(cli "uuid_audio_fork $verb_uuid start $MOCK_WS_URL mono 16000 {\"rig\":true}")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "start rejected for the verb call $verb_uuid: $out" ;;
+esac
+sleep 2
+
+out=$(cli "uuid_audio_fork $verb_uuid pause")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "pause rejected: $out" ;;
+esac
+# a second pause is a no-op, not an error
+out=$(cli "uuid_audio_fork $verb_uuid pause")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "pause was not idempotent: $out" ;;
+esac
+sleep 2
+
+paused_status=$(cli "audio_fork status")
+echo "paused: $paused_status"
+paused_forks=$(expect_num paused_forks "pause" "$paused_status")
+[ "$paused_forks" -eq 1 ] || fail "expected 1 paused fork, got $paused_forks"
+first=$(expect_num sent_bytes "pause" "$paused_status")
+sleep 1
+second=$(expect_num sent_bytes "pause" "$(cli "audio_fork status")")
+[ "$first" -eq "$second" ] || fail "a paused fork kept sending: $first then $second"
+
+out=$(cli "uuid_audio_fork $verb_uuid resume")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "resume rejected: $out" ;;
+esac
+sleep 2
+resumed=$(expect_num sent_bytes "resume" "$(cli "audio_fork status")")
+[ "$resumed" -gt "$second" ] || fail "a resumed fork sent nothing: $second then $resumed"
+
+echo "moving the fork to $MOCK_WSS_URL"
+out=$(cli "uuid_audio_fork $verb_uuid modify $MOCK_WSS_URL")
+case "$out" in
+  *"+OK"*) ;;
+  *) fail "modify rejected: $out" ;;
+esac
+sleep 4
+cli "uuid_audio_fork $verb_uuid stop" >/dev/null || true
+cli "uuid_kill $verb_uuid" >/dev/null || true
+sleep 3
+
+moved=$(cat "$WSS_REPORT")
+echo "wss report after modify: $moved"
+case "$(sid_list hellos "$moved")" in
+  *"\"$verb_uuid\""*) ;;
+  *) fail "the moved fork never said hello to the TLS server: $moved" ;;
+esac
+plain=$(cat "$REPORT")
+case "$(sid_list byes "$plain")" in
+  *"\"$verb_uuid\""*) ;;
+  *) fail "the moved fork never said bye to the plaintext server: $plain" ;;
+esac
+
 echo "SMOKE PASS"
