@@ -1,3 +1,9 @@
+x-module-image: &module-image
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: afrig-freeswitch
+
 services:
   mock-ws:
     image: python:3.12-alpine
@@ -5,38 +11,48 @@ services:
     environment:
       MOCK_WS_PORT: "9099"
       MOCK_WS_REPORT: /shared/mock-report.json
+      MOCK_WS_PLAYBACK_MS: "2000"
     volumes:
       - ./mock_ws_server/server.py:/srv/server.py:ro
       - report:/shared
 
   freeswitch:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    <<: *module-image
     depends_on:
       - mock-ws
     volumes:
-      - ./dialplan/rig.xml:/etc/freeswitch/dialplan/default/00_rig.xml:ro
+      # Alpine's freeswitch package ships no usable configuration, so the rig
+      # brings its own whole tree.
+      - ./conf:/etc/freeswitch:ro
+      # Included by an absolute path from rig/conf/freeswitch.xml: the repo copy
+      # is the module's only config source of truth.
+      - ../conf/audio_fork.conf.xml:/srv/audio_fork.conf.xml:ro
       - report:/shared
-    command: freeswitch -nc -nonat -nosql
+    # -nc daemonizes and PID 1 exits immediately; -nf keeps it in the foreground
+    command: freeswitch -nf -nonat -nosql
+    healthcheck:
+      test: ["CMD-SHELL", "fs_cli -H 127.0.0.1 -x 'audio_fork status' | grep -q forks"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
 
   smoke:
-    image: alpine:edge
+    <<: *module-image
     depends_on:
-      - freeswitch
+      freeswitch:
+        condition: service_healthy
     environment:
       MOCK_WS_URL: ws://mock-ws:9099/
       MOCK_WS_REPORT: /shared/mock-report.json
-      CALLS: "50"
+      MOCK_WS_PLAYBACK_MS: "2000"
+      CALLS: "${CALLS:-50}"
     volumes:
       - ./smoke.sh:/srv/smoke.sh:ro
       - report:/shared
     # shares the FreeSWITCH network namespace so fs_cli reaches 127.0.0.1:8021
     network_mode: service:freeswitch
-    command: >
-      sh -c "echo 'https://dl-cdn.alpinelinux.org/alpine/edge/community' >> /etc/apk/repositories &&
-             apk add --no-cache freeswitch &&
-             sh /srv/smoke.sh"
+    entrypoint: ["sh", "/srv/smoke.sh"]
 
 volumes:
   report:

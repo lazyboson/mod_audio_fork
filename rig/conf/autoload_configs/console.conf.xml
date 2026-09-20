@@ -1,0 +1,9 @@
+<configuration name="console.conf" description="rig console logger">
+  <mappings>
+    <map name="all" value="console,alert,crit,err,warning,notice,info"/>
+  </mappings>
+  <settings>
+    <param name="loglevel" value="info"/>
+    <param name="colorize" value="false"/>
+  </settings>
+</configuration>

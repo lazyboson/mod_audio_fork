@@ -1,0 +1,11 @@
+<configuration name="switch.conf" description="rig core">
+  <settings>
+    <!-- Two loopback legs per call, so 50 concurrent calls need 100 sessions. -->
+    <param name="max-sessions" value="400"/>
+    <!-- The smoke originates its calls back to back; the stock 30/s throttles
+         them into failures. -->
+    <param name="sessions-per-second" value="200"/>
+    <param name="max-db-handles" value="10"/>
+    <param name="rtp-enable-zrtp" value="false"/>
+  </settings>
+</configuration>
