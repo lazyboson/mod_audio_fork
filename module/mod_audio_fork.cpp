@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -40,6 +41,11 @@ namespace {
 
 constexpr const char* kEventSubclassPrefix = "mod_audio_fork::";
 constexpr const char* kPrivateKey = "mod_audio_fork";
+constexpr const char* kDtmfHookKey = "mod_audio_fork_dtmf";
+
+// Only its address matters: the channel private table stores pointers, and this
+// one is never dereferenced.
+int g_dtmf_hook_sentinel = 0;
 
 const char* EventName(ForkEventType type) {
   switch (type) {
@@ -393,6 +399,39 @@ void ForgetFork(const std::string& uuid, const std::shared_ptr<ForkSession>& ses
   }
 }
 
+// Runs on a FreeSWITCH session thread: SendDtmf hops to the shard, so nothing
+// here touches lws. The hook outlives the forks it was installed for —
+// FreeSWITCH only drops it when it destroys the session — so an empty registry
+// is the normal quiet case, not an error.
+switch_status_t OnRecvDtmf(switch_core_session_t* session, const switch_dtmf_t* dtmf,
+                           switch_dtmf_direction_t direction) noexcept {
+  (void)direction;
+  if (g_state == nullptr || session == nullptr || dtmf == nullptr) {
+    return SWITCH_STATUS_SUCCESS;
+  }
+  try {
+    std::vector<std::shared_ptr<ForkSession>> forks;
+    {
+      const std::scoped_lock lock(g_state->registry_mutex);
+      const auto it = g_state->registry.find(switch_core_session_get_uuid(session));
+      if (it == g_state->registry.end()) {
+        return SWITCH_STATUS_SUCCESS;
+      }
+      forks = it->second;
+    }
+    // FreeSWITCH counts DTMF duration in samples on a fixed 8kHz clock
+    // (SWITCH_DEFAULT_DTMF_DURATION = 2000 samples = 250ms)
+    const std::uint32_t duration_ms = dtmf->duration / 8;
+    for (const auto& fork : forks) {
+      (void)fork->SendDtmf(dtmf->digit, duration_ms);
+    }
+  } catch (...) {
+    // no exception may cross the C ABI (CONSTITUTION Article 6.1)
+  }
+  // always success: the other consumers of this digit must still see it
+  return SWITCH_STATUS_SUCCESS;
+}
+
 switch_status_t StartFork(switch_core_session_t* session, const char* url, const char* mix_text,
                           const char* rate_text, const char* metadata, std::string& error) {
   switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -482,6 +521,12 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
   (void)bug_state.release();
   switch_channel_set_private(channel, kPrivateKey, bug);
 
+  // one hook per channel, however many forks the call carries
+  if (switch_channel_get_private(channel, kDtmfHookKey) == nullptr &&
+      switch_core_event_hook_add_recv_dtmf(session, OnRecvDtmf) == SWITCH_STATUS_SUCCESS) {
+    switch_channel_set_private(channel, kDtmfHookKey, &g_dtmf_hook_sentinel);
+  }
+
   {
     const std::scoped_lock lock(g_state->registry_mutex);
     g_state->registry[uuid].push_back(std::move(fork));
@@ -510,6 +555,57 @@ switch_status_t StopForks(switch_core_session_t* session) {
       bug != nullptr) {
     switch_channel_set_private(channel, kPrivateKey, nullptr);
     switch_core_media_bug_remove(session, &bug);
+  }
+  if (switch_channel_get_private(channel, kDtmfHookKey) != nullptr) {
+    switch_channel_set_private(channel, kDtmfHookKey, nullptr);
+    (void)switch_core_event_hook_remove_recv_dtmf(session, OnRecvDtmf);
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+// switch_separate_string cuts the JSON payload at its first space, so the
+// payload is read from the untouched command line instead of from argv.
+const char* SendTextPayload(const char* cmd) {
+  const char* cursor = cmd;
+  for (int token = 0; token < 2; ++token) {
+    while (*cursor == ' ') {
+      ++cursor;
+    }
+    while (*cursor != '\0' && *cursor != ' ') {
+      ++cursor;
+    }
+  }
+  while (*cursor == ' ') {
+    ++cursor;
+  }
+  return cursor;
+}
+
+switch_status_t SendTextToForks(switch_core_session_t* session, const char* payload,
+                                std::string& error) {
+  if (payload == nullptr || *payload == '\0' || !nlohmann::json::accept(payload)) {
+    error = "send_text payload must be valid JSON";
+    return SWITCH_STATUS_FALSE;
+  }
+
+  std::vector<std::shared_ptr<ForkSession>> forks;
+  {
+    const std::scoped_lock lock(g_state->registry_mutex);
+    const auto it = g_state->registry.find(switch_core_session_get_uuid(session));
+    if (it == g_state->registry.end()) {
+      error = "no fork running on this channel";
+      return SWITCH_STATUS_FALSE;
+    }
+    forks = it->second;
+  }
+
+  bool delivered = false;
+  for (const auto& fork : forks) {
+    delivered = fork->SendText(payload) || delivered;
+  }
+  if (!delivered) {
+    error = "fork is stopping";
+    return SWITCH_STATUS_FALSE;
   }
   return SWITCH_STATUS_SUCCESS;
 }
@@ -559,8 +655,7 @@ SWITCH_STANDARD_API(uuid_audio_fork_api) {
       error = "no fork running on this channel";
     }
   } else if (!strcasecmp(argv[1], "send_text")) {
-    // the outbound app-text path arrives with playback in M4
-    error = "send_text is not supported yet in this build";
+    status = SendTextToForks(target, SendTextPayload(cmd), error);
   } else {
     error = "unknown subcommand";
   }
