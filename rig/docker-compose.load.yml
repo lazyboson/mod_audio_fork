@@ -28,6 +28,9 @@ services:
       - mock-ws
       - mock-wss
       - toxiproxy
+    environment:
+      AUDIOFORK_TLS_CA: "${AUDIOFORK_TLS_CA:-/srv/tls/ca.pem}"
+      AUDIOFORK_GLOBAL_CAP_MB: "${AUDIOFORK_GLOBAL_CAP_MB:-}"
     volumes:
       - ./load:/srv/load:ro
       - ./conf-load/freeswitch.xml:/etc/freeswitch/freeswitch.xml:ro
