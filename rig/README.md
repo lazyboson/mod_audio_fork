@@ -98,3 +98,47 @@ silently fall back to the OS trust store and then pass for the wrong reason.
   own memory pool, so the rig sets `session-thread-pool=false`, which gives
   every session its own thread and removes the faulting path. `run_smoke.sh`
   asserts the FreeSWITCH exit code so a regression cannot pass unnoticed.
+
+## Load tier
+
+`rig/load/run_load.sh` is the nightly tier (DESIGN.md §10, decision 17): SIPp
+drives `TOTAL_CALLS` through `mod_sofia` at `CONCURRENT` concurrency, the
+`load` dialplan context forks every call, and the run ends on the leak
+assertions. It uses `docker-compose.load.yml` on top of the base file, which
+adds SIPp and toxiproxy and puts the PR smoke behind a profile.
+
+The baseline is taken **at idle after a warm-up wave**, and the final sample is
+also at idle. Comparing an idle sample against one taken under traffic measures
+concurrency, not a leak: at 100 concurrent forks RSS is ~1.1 GB and 328 fds
+against ~130 MB and 28 at rest.
+
+Sampling runs inside the FreeSWITCH container (`rig/load/sampler.sh`). One
+`docker compose exec` per value costs tens of seconds once the box is loaded,
+which dates every row minutes after the counters in it were read and makes a
+prompt drain look like a stall.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `CONCURRENT` | 1000 | calls held open at once |
+| `TOTAL_CALLS` | 10000 | calls the run churns through |
+| `WARMUP_CALLS` | 200 | calls driven before the baseline is taken |
+| `CALL_RATE` | 50 | calls per second SIPp offers |
+| `HOLD_SECONDS` | 60 | rounded up to whole 7 s pcap plays |
+| `MAX_FAILED_CALLS` | 0 | SIPp failed calls tolerated |
+| `RSS_TOLERANCE_PERCENT` | 5 | band around the idle RSS baseline |
+| `FD_TOLERANCE` | 10 | band around the idle fd baseline |
+| `SAMPLE_SECONDS` | 5 | sampler interval |
+
+It fails on the first violation, printing the value it saw: SIPp failed calls
+over `MAX_FAILED_CALLS`, mock hellos over the run not equal to `TOTAL_CALLS`,
+any mock protocol error, a peak `sent_bytes` of 0, non-zero `forks` or
+`pool_leased_slabs` after the drain, RSS or fd outside the bands, or a
+FreeSWITCH exit code other than 0 after `fsctl shutdown`. `rig-logs/` gets
+`load-samples.csv`, `load-summary.txt`, the SIPp stat CSVs and the compose logs.
+
+Reduced scale for a laptop:
+
+```sh
+CONCURRENT=100 TOTAL_CALLS=1000 WARMUP_CALLS=300 CALL_RATE=20 HOLD_SECONDS=14 \
+  ./rig/load/run_load.sh
+```
