@@ -1,0 +1,18 @@
+<configuration name="modules.conf" description="rig load modules">
+  <modules>
+    <load module="mod_console"/>
+    <load module="mod_loopback"/>
+    <load module="mod_commands"/>
+    <load module="mod_dptools"/>
+    <load module="mod_dialplan_xml"/>
+    <load module="mod_tone_stream"/>
+    <load module="mod_event_socket"/>
+    <!-- The load tier's calls arrive over SIP from the containerised SIPp.
+         mod_verto stays absent: it links a second libwebsockets copy
+         (DESIGN.md §13). -->
+    <load module="mod_sofia"/>
+    <!-- Last, so that `audio_fork status` answering on the event socket implies
+         every module above it already loaded. -->
+    <load module="mod_audio_fork"/>
+  </modules>
+</configuration>

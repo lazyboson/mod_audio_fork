@@ -1,0 +1,15 @@
+<document type="freeswitch/xml">
+  <section name="configuration" description="rig load configuration">
+    <X-PRE-PROCESS cmd="include" data="autoload_configs/*.xml"/>
+    <X-PRE-PROCESS cmd="include" data="/srv/audio_fork.conf.xml"/>
+    <!-- A bind mount cannot create a new file inside the read-only conf tree,
+         so the load tier's additional configuration is mounted outside it and
+         pulled in by absolute path. -->
+    <X-PRE-PROCESS cmd="include" data="/srv/conf-load/*.xml"/>
+  </section>
+
+  <section name="dialplan" description="rig load dialplan">
+    <X-PRE-PROCESS cmd="include" data="dialplan/*.xml"/>
+    <X-PRE-PROCESS cmd="include" data="/srv/conf-load/dialplan/*.xml"/>
+  </section>
+</document>
