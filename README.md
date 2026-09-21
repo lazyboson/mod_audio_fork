@@ -167,3 +167,7 @@ mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback
   assertions, toxiproxy chaos matrix, and the 48h soak gate live under
   `rig/load/` and `rig/chaos/`. Until the soak gate is green, do not deploy —
   see the banner above.
+
+## License
+
+[MIT](LICENSE).
