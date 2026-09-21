@@ -6,12 +6,12 @@ set -eu
 
 . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/../load/rig_common.sh"
 
-ALL_SCENARIOS="vendor_stall half_open_tcp reconnect_storm global_cap_exhaustion
-barge_in_flood json_fuzz_replay tls_failures hangup_every_state"
+ALL_SCENARIOS="vendor_stall half_open_tcp reconnect_storm global_cap_exhaustion barge_in_flood json_fuzz_replay tls_failures hangup_every_state"
 SCENARIOS=${SCENARIOS:-$ALL_SCENARIOS}
 CALLS=${CALLS:-50}
 STORM_FORKS=${STORM_FORKS:-1000}
 CAP_FORKS=${CAP_FORKS:-20}
+CAP_LATE_FORKS=${CAP_LATE_FORKS:-5}
 GLOBAL_CAP_MB=${GLOBAL_CAP_MB:-1}
 BARGE_HZ=${BARGE_HZ:-50}
 BARGE_SECONDS=${BARGE_SECONDS:-10}
@@ -189,16 +189,23 @@ scenario_reconnect_storm() {
 scenario_global_cap_exhaustion() {
   arm_mock MOCK_WS_STALL_AFTER=5 MOCK_WS_PLAYBACK_MS=0
   recreate_freeswitch "$GLOBAL_CAP_MB"
+  # Slabs are leased as audio arrives, not at start, so the pool has to be
+  # filled by a first wave of stalled forks before a start can be refused.
   uuids=$(new_uuids "$CAP_FORKS")
   originate "$uuids"
   sleep 3
-  replies=$(start_forks "$uuids" "$DIRECT_URL")
-  sleep 20
+  start_forks "$uuids" "$DIRECT_URL" > /dev/null
+  sleep 25
+  late=$(new_uuids "$CAP_LATE_FORKS")
+  originate "$late"
+  sleep 3
+  replies=$(start_forks "$late" "$DIRECT_URL")
+  uuids="$uuids $late"
   status=$(status_json)
   refused=$(printf '%s\n' "$replies" | grep -c 'global memory cap reached' || true)
   start_failed=$(jnum start_failed "$status")
   degraded=$(jnum degraded_forks "$status")
-  say "cap ${GLOBAL_CAP_MB}MB over $CAP_FORKS forks: -ERR replies=$refused"
+  say "cap ${GLOBAL_CAP_MB}MB, $CAP_FORKS stalled forks then $CAP_LATE_FORKS more: -ERR replies=$refused"
   say "start_failed=$start_failed degraded_forks=$degraded"
   kill_calls "$uuids"
   [ "${refused:-0}" -ge 1 ] ||
