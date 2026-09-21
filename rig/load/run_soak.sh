@@ -54,6 +54,10 @@ sleep "$SETTLE_SECONDS"
 baseline_rss=$(fs_rss_kb)
 baseline_fd=$(fs_fd_count)
 hellos_before=$(jnum hello_count "$(compose exec -T freeswitch cat /shared/mock-report.json)")
+# The sampler starts before the warm-up, so the rows it has already written
+# predate the baseline and cannot be judged against it.
+baseline_rows=$(compose exec -T freeswitch wc -l "/shared/$(basename "$CSV")" |
+  awk '{ print $1 }' | tr -d '\r')
 echo "baseline at idle: rss=${baseline_rss}kB fds=$baseline_fd hellos=$hellos_before"
 
 # One call is HOLD_SECONDS long, so CONCURRENT/HOLD_SECONDS calls a second keeps
@@ -85,8 +89,9 @@ fd_high=$((baseline_fd + FD_TOLERANCE))
 # The gate is the whole curve, not the last point: a leak that plateaus inside
 # the band at the end still has to have stayed inside it throughout. Only the
 # idle rows count, since RSS under traffic is concurrency, not growth.
-breaches=$(awk -F, -v lo="$rss_low" -v hi="$rss_high" -v flo="$fd_low" -v fhi="$fd_high" '
-  NR > 1 && $2 == 0 && $9 != "" {
+breaches=$(awk -F, -v lo="$rss_low" -v hi="$rss_high" -v flo="$fd_low" -v fhi="$fd_high" \
+  -v skip="$baseline_rows" '
+  NR > skip && $2 == 0 && $9 != "" {
     idle++
     if ($9 < lo || $9 > hi || $10 < flo || $10 > fhi) { print "  " $0; breach++ }
   }
