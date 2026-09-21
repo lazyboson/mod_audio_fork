@@ -1,0 +1,34 @@
+services:
+  # The PR smoke is the base file's default workload; the load and chaos tiers
+  # drive their own calls, so it only runs when its profile is asked for.
+  smoke:
+    profiles: ["smoke"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host", "0.0.0.0", "-port", "8474"]
+
+  freeswitch:
+    depends_on:
+      - mock-ws
+      - mock-wss
+      - toxiproxy
+    volumes:
+      - ./conf-load/freeswitch.xml:/etc/freeswitch/freeswitch.xml:ro
+      - ./conf-load/autoload_configs/modules.conf.xml:/etc/freeswitch/autoload_configs/modules.conf.xml:ro
+      - ./conf-load/autoload_configs/switch.conf.xml:/etc/freeswitch/autoload_configs/switch.conf.xml:ro
+      - ./conf-load:/srv/conf-load:ro
+
+  sipp:
+    build:
+      context: .
+      dockerfile: load/Dockerfile.sipp
+    image: ${SIPP_IMAGE:-afrig-sipp}
+    depends_on:
+      - freeswitch
+    volumes:
+      - ./load:/srv/load:ro
+      - ../rig-logs:/shared/logs
+    # SIPp's own exit code is the call-failure verdict, so the container must
+    # not be restarted or its status rewritten by compose.
+    restart: "no"
