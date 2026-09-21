@@ -185,3 +185,32 @@ SCENARIOS="vendor_stall tls_failures" CALLS=5 ./rig/chaos/run_chaos.sh
 ```
 
 The PASS/FAIL table lands in `rig-logs/chaos-table.txt`.
+
+## Soak gate
+
+`rig/load/run_soak.sh` is the release gate of DESIGN.md §10 decision 18: churn
+at `CONCURRENT` (default 800) for `SOAK_HOURS` (default 48), sampling every 60 s.
+It reuses the load tier's warm-up, idle baseline and in-container sampler, and
+turns the requested duration into a SIPp call count from `CONCURRENT` and
+`HOLD_SECONDS`.
+
+The gate is the whole curve, not the end point: every **idle** sample — a row
+whose `forks` is 0, since RSS under traffic is concurrency rather than growth —
+must sit inside ±`RSS_TOLERANCE_PERCENT` and ±`FD_TOLERANCE` of the baseline. A
+leak that plateaus inside the band before the run ends would otherwise pass. The
+end-state assertions of the load tier apply on top: exact hello count, no
+protocol errors, zero forks, zero leased slabs, FreeSWITCH exit 0.
+
+Knobs are the load tier's, plus `SOAK_HOURS` and `SAMPLE_SECONDS` (60).
+Reduced scale:
+
+```sh
+SOAK_HOURS=0.15 CONCURRENT=50 WARMUP_CALLS=50 CALL_RATE=10 HOLD_SECONDS=14 \
+  SAMPLE_SECONDS=10 SETTLE_SECONDS=20 ./rig/load/run_soak.sh
+```
+
+`.github/workflows/soak.yml` dispatches it manually with those knobs as inputs.
+It runs on `[self-hosted, soak]`: GitHub-hosted runners cap a job at 6 hours, so
+a 48 h gate cannot run there. `.github/workflows/nightly.yml` runs the load tier
+and the chaos matrix at 03:00 daily, both uploading `rig-logs/` whatever the
+outcome.
