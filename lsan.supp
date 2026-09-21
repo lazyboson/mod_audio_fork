@@ -1,0 +1,5 @@
+# lws_context_init_ssl_library allocates a pthread_mutex table for OpenSSL's
+# pre-1.1 locking callbacks (lib/tls/openssl/openssl-tls.c, the LWS_MAX_SMP != 1
+# block) once per process and never frees it: OpenSSL 1.1+ ignores the callbacks
+# and lws has no teardown for the table. Process-lifetime by design, not growth.
+leak:lws_context_init_ssl_library

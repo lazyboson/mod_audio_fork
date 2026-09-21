@@ -97,10 +97,14 @@ void Shard::StopThread() {
 Shard::~Shard() { StopThread(); }
 
 void Shard::Adopt(std::shared_ptr<ForkSession> session) {
+  // Counted on the caller's thread, before the hop: LeastLoadedShard reads
+  // load() from that same thread, and a burst of starts would otherwise all see
+  // zero and pile onto one shard. Relaxed suffices: the count is a placement
+  // heuristic and publishes no other state.
+  load_.fetch_add(1, std::memory_order_relaxed);
   // hop onto the loop thread: sessions_ is loop-owned state
   loop_->Post([this, session = std::move(session)]() mutable {
     sessions_.push_back(session);
-    load_.store(sessions_.size(), std::memory_order_relaxed);
     session->Start();
   });
 }
@@ -114,8 +118,9 @@ void Shard::Tick() {
                                                 return session->state() != SessionState::kDead;
                                               });
   if (finished != sessions_.end()) {
+    load_.fetch_sub(static_cast<std::size_t>(sessions_.end() - finished),
+                    std::memory_order_relaxed);
     sessions_.erase(finished, sessions_.end());
-    load_.store(sessions_.size(), std::memory_order_relaxed);
   }
 }
 

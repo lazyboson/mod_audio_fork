@@ -146,7 +146,7 @@ struct Fixture {
   explicit Fixture(std::chrono::milliseconds send_buffer = milliseconds{1000},
                    std::chrono::milliseconds handoff = milliseconds{500},
                    std::chrono::milliseconds emergency = milliseconds{0},
-                   std::optional<SlabPool> shared_pool = std::nullopt) {
+                   const std::optional<SlabPool>& shared_pool = std::nullopt) {
     pool =
         shared_pool.has_value() ? shared_pool : SlabPool::Create({4096, std::size_t{4096} * 512});
     ForkParams params;

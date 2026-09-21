@@ -304,7 +304,7 @@ TEST(Playback, RepeatedBargeInsStayConsistent) {
 
 TEST(Playback, PoolExhaustionDropsInboundAudioInsteadOfBlocking) {
   Fixture fx(milliseconds{1000}, milliseconds{200}, /*playback=*/true, /*pool_slabs=*/2);
-  const auto audio = Tone(4096 * 4);
+  const auto audio = Tone(std::size_t{4096} * 4);
   fx.net.handler().OnBinary(ConstByteSpan(audio));
 
   const ForkSession::Stats stats = fx.session->stats();
