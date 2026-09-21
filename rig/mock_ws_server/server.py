@@ -307,7 +307,7 @@ def _fuzz_frames() -> list[bytes]:
                 corpus.append(handle.read())
     # Seeded, so a nightly failure replays byte for byte from the report alone.
     rng = random.Random(0x5EED)
-    frames = list(corpus)
+    frames = []
     for _ in range(FUZZ_MUTATIONS):
         if not corpus:
             break
@@ -317,7 +317,9 @@ def _fuzz_frames() -> list[bytes]:
         else:
             body.insert(rng.randrange(len(body) + 1), rng.randrange(256))
         frames.append(bytes(body))
-    return frames
+    # The corpus goes last because it holds a well-formed {"type":"disconnect"},
+    # which legitimately retires the fork and would cut the mutations short.
+    return frames + corpus
 
 
 def _replay_fuzz(conn: socket.socket, send_lock: threading.Lock, stop: threading.Event) -> None:
