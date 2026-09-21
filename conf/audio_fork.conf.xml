@@ -16,6 +16,9 @@
          stalled forks degrade rather than letting FreeSWITCH be OOM-killed -->
     <param name="global-memory-cap-mb" value="1536"/>
 
+    <!-- what a fork keeps buffered once the global cap is hit -->
+    <param name="emergency-buffer-seconds" value="2"/>
+
     <!-- playback (server -> caller): above the high watermark the module stops
          reading the socket so the server's audio waits in TCP rather than in
          our memory; reading resumes below the low watermark -->
@@ -26,5 +29,15 @@
     <param name="reconnect-backoff-max-ms" value="5000"/>
 
     <param name="max-forks-per-call" value="4"/>
+
+    <!-- wss:// trust. An empty ca-file uses the OS trust store; cert and key
+         are the client certificate for mTLS and are set together or not at all -->
+    <param name="tls-ca-file" value=""/>
+    <param name="tls-cert-file" value=""/>
+    <param name="tls-key-file" value=""/>
+
+    <!-- off accepts any server certificate, including self-signed and expired,
+         and skips the hostname check: test rigs only -->
+    <param name="tls-verify" value="true"/>
   </settings>
 </configuration>

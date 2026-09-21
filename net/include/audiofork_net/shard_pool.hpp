@@ -44,7 +44,8 @@ class LwsNetPort : public NetPort {
 // context, closes it by construction.
 class Shard {
  public:
-  [[nodiscard]] static std::unique_ptr<Shard> Create(std::chrono::milliseconds tick);
+  [[nodiscard]] static std::unique_ptr<Shard> Create(std::chrono::milliseconds tick,
+                                                     const TlsOptions& tls);
   void StartThread();
   void StopThread();
   ~Shard();
@@ -86,6 +87,8 @@ class ShardPool {
                                                        EventSink& events, Clock& clock);
   [[nodiscard]] std::size_t shard_count() const { return shards_.size(); }
   [[nodiscard]] std::size_t active_forks() const;
+  // Per-shard fork counts in shard order, for the status command's load view.
+  [[nodiscard]] std::vector<std::size_t> shard_loads() const;
   [[nodiscard]] SlabPool& pool() { return pool_; }
 
   explicit ShardPool(SlabPool pool) : pool_(std::move(pool)) {}

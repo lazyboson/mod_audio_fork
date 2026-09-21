@@ -1,0 +1,15 @@
+<document type="freeswitch/xml">
+  <section name="configuration" description="rig configuration">
+    <X-PRE-PROCESS cmd="include" data="autoload_configs/*.xml"/>
+    <!-- The module's shipped config is bind-mounted from the repo's
+         conf/audio_fork.conf.xml. It has to live outside this tree because a
+         nested bind mount cannot create its mountpoint inside a read-only one,
+         and an absolute X-PRE-PROCESS path is how it still lands in the
+         configuration section. -->
+    <X-PRE-PROCESS cmd="include" data="/srv/audio_fork.conf.xml"/>
+  </section>
+
+  <section name="dialplan" description="rig dialplan">
+    <X-PRE-PROCESS cmd="include" data="dialplan/*.xml"/>
+  </section>
+</document>

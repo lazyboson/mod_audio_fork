@@ -58,11 +58,17 @@ class SlabPool {
     std::size_t allocated_bytes;
     std::size_t leased_slabs;
     std::size_t free_slabs;
+    std::size_t cap_bytes;
   };
 
   [[nodiscard]] static std::optional<SlabPool> Create(SlabPoolOptions options);
 
   [[nodiscard]] std::optional<SlabLease> Acquire();
+
+  // Advisory: another thread may take the last slab between this answering true
+  // and the caller acquiring. It refuses work that could never fit, it does not
+  // reserve anything.
+  [[nodiscard]] bool CanLease(std::size_t slabs) const;
   [[nodiscard]] Stats stats() const;
 
  private:

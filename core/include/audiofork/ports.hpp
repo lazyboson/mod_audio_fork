@@ -59,6 +59,7 @@ class NetPort {
 enum class ForkEventType : std::uint8_t {
   kConnect,
   kConnectFailed,
+  kStartFailed,
   kReconnecting,
   kResume,
   kOverrun,

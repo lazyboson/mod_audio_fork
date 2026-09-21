@@ -50,6 +50,28 @@ TEST(SlabPool, AcquireFailsBeyondCap) {
   EXPECT_EQ(stats.free_slabs, 0U);
 }
 
+TEST(SlabPool, StatsReportTheConfiguredCap) { EXPECT_EQ(MakePool(4).stats().cap_bytes, kSlab * 4); }
+
+TEST(SlabPool, CanLeaseCountsFreeAndUnallocatedSlabs) {
+  auto pool = MakePool(4);
+  EXPECT_TRUE(pool.CanLease(4));
+  EXPECT_FALSE(pool.CanLease(5));
+  EXPECT_TRUE(pool.CanLease(0));
+
+  std::vector<SlabLease> held;
+  for (int i = 0; i < 3; ++i) {
+    auto lease = pool.Acquire();
+    ASSERT_TRUE(lease.has_value());
+    held.push_back(*std::move(lease));
+  }
+  EXPECT_TRUE(pool.CanLease(1));
+  EXPECT_FALSE(pool.CanLease(2));
+
+  // a returned slab is leasable again without any new allocation
+  held.pop_back();
+  EXPECT_TRUE(pool.CanLease(2));
+}
+
 TEST(SlabPool, ReleasedSlabIsReusedWithoutNewAllocation) {
   auto pool = MakePool(1);
   {

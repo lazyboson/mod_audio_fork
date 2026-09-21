@@ -14,6 +14,7 @@ jobs:
         preset: [asan, tsan, release]
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - run: cmake --preset ${{ matrix.preset }}
       - run: cmake --build --preset ${{ matrix.preset }} --parallel
       - run: ctest --preset ${{ matrix.preset }}
@@ -34,14 +35,98 @@ jobs:
           cmake -S . -B build/module -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
             -DAUDIOFORK_BUILD_MODULE=ON
           cmake --build build/module --parallel
-      - name: the module must export the FreeSWITCH interface and no lws symbols
+      - name: the interface symbol must be the only thing the module exports
         run: |
-          nm -D --defined-only build/module/module/mod_audio_fork.so > exported.txt
-          grep -q mod_audio_fork_module_interface exported.txt
-          if grep -q ' lws_' exported.txt; then
-            echo "vendored libwebsockets symbols leaked into the module" >&2
+          nm -D --defined-only build/module/module/mod_audio_fork.so |
+            awk '{ print $NF }' | sort > exported.txt
+          grep -qx mod_audio_fork_module_interface exported.txt
+          # Anything else is a leak: vendored lws, a statically linked OpenSSL
+          # instead of the one FreeSWITCH already loaded, nlohmann/json, or
+          # core/ internals (DESIGN.md §13). The linker-defined names are
+          # allowed because ld may keep them global despite the version script.
+          leaked=$(grep -vxE '(mod_audio_fork_module_interface|_init|_fini|__bss_start|_edata|_end)' exported.txt || true)
+          if [ -n "$leaked" ]; then
+            echo "$leaked" >&2
+            echo "the symbols above leak out of mod_audio_fork.so" >&2
             exit 1
           fi
+      - name: the module must link libssl and libcrypto dynamically
+        run: |
+          # ldd exits non-zero here: the switch_* imports resolve only from the
+          # running FreeSWITCH binary at dlopen time
+          ldd build/module/module/mod_audio_fork.so > linked.txt 2>&1 || true
+          grep -q libssl.so linked.txt
+          grep -q libcrypto.so linked.txt
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe needs the tags, which the default shallow fetch omits
+          fetch-depth: 0
+      - name: build the runtime image
+        run: |
+          docker build --build-arg AUDIOFORK_VERSION="$(git describe --tags --always)" \
+            -t mod_audio_fork:ci .
+      - name: extract the SBOM
+        run: |
+          docker run --rm mod_audio_fork:ci \
+            cat /usr/share/doc/mod_audio_fork/sbom.cdx.json > sbom.cdx.json
+      - name: the SBOM must name the pins this build actually used
+        run: |
+          python3 - <<'PY'
+          import json, re
+
+          bom = json.load(open("sbom.cdx.json"))
+          assert bom["bomFormat"] == "CycloneDX", bom["bomFormat"]
+          assert bom["specVersion"] == "1.5", bom["specVersion"]
+          assert bom["metadata"]["component"]["name"] == "mod_audio_fork"
+          assert bom["metadata"]["component"]["version"], "no version for the module itself"
+
+          by_ref = {c["bom-ref"]: c for c in bom["components"]}
+
+          def pinned(path, pattern):
+              match = re.search(pattern, open(path).read())
+              assert match, f"no pin matching {pattern} in {path}"
+              return match.group(1)
+
+          expected = {
+              "libwebsockets": pinned(
+                  "net/CMakeLists.txt",
+                  r"URL https://github\.com/warmcat/libwebsockets/archive/refs/tags/v(\S+)\.tar\.gz"),
+              "nlohmann-json": pinned(
+                  "core/CMakeLists.txt",
+                  r"URL https://github\.com/nlohmann/json/releases/download/v(\S+)/"),
+          }
+          for ref, version in expected.items():
+              assert by_ref[ref]["version"] == version, (ref, by_ref[ref]["version"], version)
+
+          assert by_ref["libwebsockets"]["pedigree"]["patches"], "the lws patch is not declared"
+          assert by_ref["openssl"]["purl"].startswith("pkg:apk/alpine/"), by_ref["openssl"]["purl"]
+          assert by_ref["openssl"]["version"], "no version for the system OpenSSL"
+
+          for component in bom["components"]:
+              print(component["name"], component["version"], component["purl"])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  rig-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: 50-call smoke, audio integrity and a clean FreeSWITCH shutdown
+        run: ./rig/run_smoke.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: rig-smoke-logs
+          path: rig-logs.txt
 
   fuzz:
     runs-on: ubuntu-latest
@@ -67,6 +152,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang-tidy
+      - run: sudo apt-get update && sudo apt-get install -y clang-tidy libssl-dev
       - run: cmake --preset debug
       - run: run-clang-tidy -p build/debug -quiet 'core/(src|tests)/.*\.cpp'

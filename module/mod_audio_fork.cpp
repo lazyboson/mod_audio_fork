@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -40,6 +43,11 @@ namespace {
 
 constexpr const char* kEventSubclassPrefix = "mod_audio_fork::";
 constexpr const char* kPrivateKey = "mod_audio_fork";
+constexpr const char* kDtmfHookKey = "mod_audio_fork_dtmf";
+
+// Only its address matters: the channel private table stores pointers, and this
+// one is never dereferenced.
+int g_dtmf_hook_sentinel = 0;
 
 const char* EventName(ForkEventType type) {
   switch (type) {
@@ -47,6 +55,8 @@ const char* EventName(ForkEventType type) {
       return "connect";
     case ForkEventType::kConnectFailed:
       return "connect_failed";
+    case ForkEventType::kStartFailed:
+      return "start_failed";
     case ForkEventType::kReconnecting:
       return "reconnecting";
     case ForkEventType::kResume:
@@ -128,6 +138,7 @@ struct ModuleState {
 
   std::mutex registry_mutex;
   std::unordered_map<std::string, std::vector<std::shared_ptr<ForkSession>>> registry;
+  std::atomic<std::uint64_t> start_failed{0};
 };
 
 ModuleState* g_state = nullptr;
@@ -158,6 +169,8 @@ ModuleConfig LoadConfig() {
         config.playback_low_watermark = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "coalesce-max-ms")) {
         config.coalesce_max = std::chrono::milliseconds{number};
+      } else if (!strcasecmp(name, "emergency-buffer-seconds")) {
+        config.emergency_buffer = std::chrono::milliseconds{number * 1000};
       } else if (!strcasecmp(name, "global-memory-cap-mb")) {
         config.global_memory_cap_bytes =
             static_cast<std::size_t>(std::max(number, 1)) * 1024 * 1024;
@@ -167,11 +180,31 @@ ModuleConfig LoadConfig() {
         config.reconnect_max = std::chrono::milliseconds{number};
       } else if (!strcasecmp(name, "max-forks-per-call")) {
         config.max_forks_per_call = static_cast<std::size_t>(std::max(number, 1));
+      } else if (!strcasecmp(name, "tls-ca-file")) {
+        config.tls.ca_file = value;
+      } else if (!strcasecmp(name, "tls-cert-file")) {
+        config.tls.cert_file = value;
+      } else if (!strcasecmp(name, "tls-key-file")) {
+        config.tls.key_file = value;
+      } else if (!strcasecmp(name, "tls-verify")) {
+        config.tls.verify = switch_true(value) != 0;
       }
     }
   }
   switch_xml_free(xml);
-  return audiofork::SanitizeConfig(config);
+  const bool half_a_client_certificate =
+      config.tls.cert_file.empty() != config.tls.key_file.empty();
+  const ModuleConfig sanitized = audiofork::SanitizeConfig(config);
+  if (half_a_client_certificate) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                      "tls-cert-file and tls-key-file must both be set; "
+                      "continuing without a client certificate\n");
+  }
+  if (!sanitized.tls.verify) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                      "tls-verify is off: wss:// forks accept any server certificate\n");
+  }
+  return sanitized;
 }
 
 bool ParseEndpoint(const char* url, Endpoint& endpoint, std::string& error) {
@@ -179,38 +212,11 @@ bool ParseEndpoint(const char* url, Endpoint& endpoint, std::string& error) {
     error = "missing url";
     return false;
   }
-  std::string text(url);
-  if (text.rfind("wss://", 0) == 0) {
-    endpoint.tls = true;
-    text.erase(0, 6);
-  } else if (text.rfind("ws://", 0) == 0) {
-    endpoint.tls = false;
-    text.erase(0, 5);
-  } else {
-    error = "url must start with ws:// or wss://";
+  const std::optional<Endpoint> parsed = audiofork::ParseWsUrl(url, error);
+  if (!parsed.has_value()) {
     return false;
   }
-  const std::size_t slash = text.find('/');
-  std::string authority = text.substr(0, slash);
-  endpoint.path = slash == std::string::npos ? "/" : text.substr(slash);
-  const std::size_t colon = authority.rfind(':');
-  if (colon != std::string::npos) {
-    endpoint.port = static_cast<std::uint16_t>(atoi(authority.substr(colon + 1).c_str()));
-    authority.erase(colon);
-  } else {
-    endpoint.port = endpoint.tls ? 443 : 80;
-  }
-  endpoint.host = authority;
-  if (endpoint.host.empty() || endpoint.port == 0) {
-    error = "url has no host or port";
-    return false;
-  }
-  if (endpoint.tls) {
-    // TLS lands with the vendored-lws build in M5; refusing beats silently
-    // streaming call audio in the clear
-    error = "wss:// is not supported yet in this build";
-    return false;
-  }
+  endpoint = *parsed;
   return true;
 }
 
@@ -236,6 +242,7 @@ ForkSession::Tuning MakeTuning(const ModuleConfig& config, const AudioFormat& fo
   tuning.send_cap_bytes = format.BytesForDuration(config.send_buffer);
   tuning.handoff_bytes = format.BytesForDuration(config.handoff_buffer);
   tuning.coalesce_max_bytes = format.BytesForDuration(config.coalesce_max);
+  tuning.emergency_cap_bytes = format.BytesForDuration(config.emergency_buffer);
   tuning.drain_timeout = config.drain_timeout;
   tuning.backoff = {config.reconnect_min, config.reconnect_max, 2.0, 0.25};
   // playback is sized in mono at the fork rate: the server sends one stream for
@@ -393,6 +400,48 @@ void ForgetFork(const std::string& uuid, const std::shared_ptr<ForkSession>& ses
   }
 }
 
+std::vector<std::shared_ptr<ForkSession>> ForksFor(const std::string& uuid) {
+  const std::scoped_lock lock(g_state->registry_mutex);
+  const auto it = g_state->registry.find(uuid);
+  return it == g_state->registry.end() ? std::vector<std::shared_ptr<ForkSession>>{} : it->second;
+}
+
+// Runs on a FreeSWITCH session thread: SendDtmf hops to the shard, so nothing
+// here touches lws. The hook outlives the forks it was installed for —
+// FreeSWITCH only drops it when it destroys the session — so an empty registry
+// is the normal quiet case, not an error.
+switch_status_t OnRecvDtmf(switch_core_session_t* session, const switch_dtmf_t* dtmf,
+                           switch_dtmf_direction_t direction) noexcept {
+  (void)direction;
+  if (g_state == nullptr || session == nullptr || dtmf == nullptr) {
+    return SWITCH_STATUS_SUCCESS;
+  }
+  try {
+    const std::vector<std::shared_ptr<ForkSession>> forks =
+        ForksFor(switch_core_session_get_uuid(session));
+    // FreeSWITCH counts DTMF duration in samples on a fixed 8kHz clock
+    // (SWITCH_DEFAULT_DTMF_DURATION = 2000 samples = 250ms)
+    const std::uint32_t duration_ms = dtmf->duration / 8;
+    for (const auto& fork : forks) {
+      (void)fork->SendDtmf(dtmf->digit, duration_ms);
+    }
+  } catch (...) {
+    // no exception may cross the C ABI (CONSTITUTION Article 6.1)
+  }
+  // always success: the other consumers of this digit must still see it
+  return SWITCH_STATUS_SUCCESS;
+}
+
+// fork_id stays empty: the fork never got far enough to have one.
+void EmitStartFailed(const std::string& uuid, const std::string& reason) {
+  g_state->start_failed.fetch_add(1, std::memory_order_relaxed);
+  ForkEvent event;
+  event.type = ForkEventType::kStartFailed;
+  event.call_uuid = uuid;
+  event.detail = reason;
+  g_state->events.Emit(event);
+}
+
 switch_status_t StartFork(switch_core_session_t* session, const char* url, const char* mix_text,
                           const char* rate_text, const char* metadata, std::string& error) {
   switch_channel_t* channel = switch_core_session_get_channel(session);
@@ -432,10 +481,18 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
   params.mix_type = mix;
   params.metadata_json = metadata == nullptr ? "" : metadata;
 
-  auto fork = g_state->shards->StartFork(params, MakeTuning(g_state->config, wire_format),
-                                         g_state->events, g_state->clock);
+  const ForkSession::Tuning tuning = MakeTuning(g_state->config, wire_format);
+  if (!g_state->pool->CanLease(
+          ForkSession::MinimumSlabs(tuning, g_state->pool->stats().slab_size_bytes))) {
+    error = "global memory cap reached";
+    EmitStartFailed(uuid, error);
+    return SWITCH_STATUS_FALSE;
+  }
+
+  auto fork = g_state->shards->StartFork(params, tuning, g_state->events, g_state->clock);
   if (fork == nullptr) {
     error = "fork could not be created";
+    EmitStartFailed(uuid, error);
     return SWITCH_STATUS_FALSE;
   }
   fork->set_on_finished([uuid, weak = std::weak_ptr<ForkSession>(fork)] {
@@ -482,6 +539,12 @@ switch_status_t StartFork(switch_core_session_t* session, const char* url, const
   (void)bug_state.release();
   switch_channel_set_private(channel, kPrivateKey, bug);
 
+  // one hook per channel, however many forks the call carries
+  if (switch_channel_get_private(channel, kDtmfHookKey) == nullptr &&
+      switch_core_event_hook_add_recv_dtmf(session, OnRecvDtmf) == SWITCH_STATUS_SUCCESS) {
+    switch_channel_set_private(channel, kDtmfHookKey, &g_dtmf_hook_sentinel);
+  }
+
   {
     const std::scoped_lock lock(g_state->registry_mutex);
     g_state->registry[uuid].push_back(std::move(fork));
@@ -493,16 +556,8 @@ switch_status_t StopForks(switch_core_session_t* session) {
   switch_channel_t* channel = switch_core_session_get_channel(session);
   const std::string uuid = switch_core_session_get_uuid(session);
 
-  std::vector<std::shared_ptr<ForkSession>> forks;
-  {
-    const std::scoped_lock lock(g_state->registry_mutex);
-    const auto it = g_state->registry.find(uuid);
-    if (it == g_state->registry.end()) {
-      return SWITCH_STATUS_FALSE;
-    }
-    forks = it->second;
-  }
-  for (auto& fork : forks) {
+  const std::vector<std::shared_ptr<ForkSession>> forks = ForksFor(uuid);
+  for (const auto& fork : forks) {
     fork->Stop();
   }
   if (auto* bug =
@@ -510,6 +565,90 @@ switch_status_t StopForks(switch_core_session_t* session) {
       bug != nullptr) {
     switch_channel_set_private(channel, kPrivateKey, nullptr);
     switch_core_media_bug_remove(session, &bug);
+  }
+  if (switch_channel_get_private(channel, kDtmfHookKey) != nullptr) {
+    switch_channel_set_private(channel, kDtmfHookKey, nullptr);
+    (void)switch_core_event_hook_remove_recv_dtmf(session, OnRecvDtmf);
+  }
+  // forks that already retired on their own still leave the channel to clean
+  // up, but there was nothing here to stop
+  return forks.empty() ? SWITCH_STATUS_FALSE : SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t SetForksPaused(switch_core_session_t* session, bool paused, std::string& error) {
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
+  }
+  for (const auto& fork : forks) {
+    fork->SetPaused(paused);
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+switch_status_t ModifyForks(switch_core_session_t* session, const char* url, std::string& error) {
+  Endpoint endpoint;
+  if (!ParseEndpoint(url, endpoint, error)) {
+    return SWITCH_STATUS_FALSE;
+  }
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
+  }
+  bool applied = false;
+  for (const auto& fork : forks) {
+    applied = fork->Modify(endpoint) || applied;
+  }
+  if (!applied) {
+    error = "fork is stopping";
+    return SWITCH_STATUS_FALSE;
+  }
+  return SWITCH_STATUS_SUCCESS;
+}
+
+// switch_separate_string cuts the JSON payload at its first space, so the
+// payload is read from the untouched command line instead of from argv.
+const char* SendTextPayload(const char* cmd) {
+  const char* cursor = cmd;
+  for (int token = 0; token < 2; ++token) {
+    while (*cursor == ' ') {
+      ++cursor;
+    }
+    while (*cursor != '\0' && *cursor != ' ') {
+      ++cursor;
+    }
+  }
+  while (*cursor == ' ') {
+    ++cursor;
+  }
+  return cursor;
+}
+
+switch_status_t SendTextToForks(switch_core_session_t* session, const char* payload,
+                                std::string& error) {
+  if (payload == nullptr || *payload == '\0' || !nlohmann::json::accept(payload)) {
+    error = "send_text payload must be valid JSON";
+    return SWITCH_STATUS_FALSE;
+  }
+
+  const std::vector<std::shared_ptr<ForkSession>> forks =
+      ForksFor(switch_core_session_get_uuid(session));
+  if (forks.empty()) {
+    error = "no fork running on this channel";
+    return SWITCH_STATUS_FALSE;
+  }
+
+  bool delivered = false;
+  for (const auto& fork : forks) {
+    delivered = fork->SendText(payload) || delivered;
+  }
+  if (!delivered) {
+    error = "fork is stopping";
+    return SWITCH_STATUS_FALSE;
   }
   return SWITCH_STATUS_SUCCESS;
 }
@@ -522,8 +661,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown);
 SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shutdown, nullptr);
 
-#define AUDIO_FORK_API_SYNTAX \
-  "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> send_text <json>"
+#define AUDIO_FORK_API_SYNTAX                                                   \
+  "<uuid> start <wss-url> <mix-type> <rate> [metadata] | <uuid> stop | <uuid> " \
+  "send_text <json> | <uuid> pause | <uuid> resume | <uuid> modify <wss-url>"
 
 SWITCH_STANDARD_API(uuid_audio_fork_api) {
   (void)session;
@@ -558,9 +698,14 @@ SWITCH_STANDARD_API(uuid_audio_fork_api) {
     if (status != SWITCH_STATUS_SUCCESS) {
       error = "no fork running on this channel";
     }
+  } else if (!strcasecmp(argv[1], "modify")) {
+    status = ModifyForks(target, argc > 2 ? argv[2] : nullptr, error);
+  } else if (!strcasecmp(argv[1], "pause")) {
+    status = SetForksPaused(target, true, error);
+  } else if (!strcasecmp(argv[1], "resume")) {
+    status = SetForksPaused(target, false, error);
   } else if (!strcasecmp(argv[1], "send_text")) {
-    // the outbound app-text path arrives with playback in M4
-    error = "send_text is not supported yet in this build";
+    status = SendTextToForks(target, SendTextPayload(cmd), error);
   } else {
     error = "unknown subcommand";
   }
@@ -581,13 +726,20 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
   (void)session;
   std::size_t calls = 0;
   std::size_t forks = 0;
+  std::size_t degraded_forks = 0;
+  std::size_t paused_forks = 0;
   std::uint64_t media_dropped = 0;
   std::uint64_t buffer_dropped = 0;
   std::uint64_t sent = 0;
   std::uint64_t reconnects = 0;
   std::size_t buffered = 0;
+  std::size_t buffered_max = 0;
   std::uint64_t playback_played = 0;
+  std::uint64_t playback_dropped = 0;
+  std::size_t playback_buffered = 0;
+  std::size_t playback_buffered_max = 0;
   std::uint64_t barge_ins = 0;
+  std::uint64_t texts_dropped = 0;
   {
     const std::scoped_lock lock(g_state->registry_mutex);
     calls = g_state->registry.size();
@@ -600,25 +752,45 @@ SWITCH_STANDARD_API(audio_fork_status_api) {
         sent += stats.sent_bytes;
         reconnects += stats.reconnects;
         buffered += stats.buffered_bytes;
+        buffered_max = std::max(buffered_max, stats.buffered_bytes);
         playback_played += stats.playback_bytes_played;
+        playback_dropped += stats.playback_bytes_dropped;
+        playback_buffered += stats.playback_buffered_bytes;
+        playback_buffered_max = std::max(playback_buffered_max, stats.playback_buffered_bytes);
         barge_ins += stats.barge_ins;
+        texts_dropped += stats.pending_texts_dropped;
+        degraded_forks += static_cast<std::size_t>(stats.degraded);
+        paused_forks += static_cast<std::size_t>(stats.paused);
       }
     }
   }
   const SlabPool::Stats pool = g_state->pool->stats();
-  stream->write_function(
-      stream,
-      "{\"calls\":%lu,\"forks\":%lu,\"shards\":%lu,\"sent_bytes\":%llu,"
-      "\"media_dropped_bytes\":%llu,\"buffer_dropped_bytes\":%llu,\"reconnects\":%llu,"
-      "\"buffered_bytes\":%lu,\"playback_bytes_played\":%llu,\"barge_ins\":%llu,"
-      "\"pool_allocated_bytes\":%lu,\"pool_leased_slabs\":%lu}\n",
-      static_cast<unsigned long>(calls), static_cast<unsigned long>(forks),
-      static_cast<unsigned long>(g_state->shards->shard_count()),
-      static_cast<unsigned long long>(sent), static_cast<unsigned long long>(media_dropped),
-      static_cast<unsigned long long>(buffer_dropped), static_cast<unsigned long long>(reconnects),
-      static_cast<unsigned long>(buffered), static_cast<unsigned long long>(playback_played),
-      static_cast<unsigned long long>(barge_ins), static_cast<unsigned long>(pool.allocated_bytes),
-      static_cast<unsigned long>(pool.leased_slabs));
+  const nlohmann::ordered_json status{
+      {"calls", calls},
+      {"forks", forks},
+      {"shards", g_state->shards->shard_count()},
+      {"sent_bytes", sent},
+      {"media_dropped_bytes", media_dropped},
+      {"buffer_dropped_bytes", buffer_dropped},
+      {"reconnects", reconnects},
+      {"buffered_bytes", buffered},
+      {"buffered_bytes_max", buffered_max},
+      {"playback_bytes_played", playback_played},
+      {"playback_bytes_dropped", playback_dropped},
+      {"playback_buffered_bytes", playback_buffered},
+      {"playback_buffered_bytes_max", playback_buffered_max},
+      {"barge_ins", barge_ins},
+      {"pending_texts_dropped", texts_dropped},
+      {"degraded_forks", degraded_forks},
+      {"paused_forks", paused_forks},
+      {"start_failed", g_state->start_failed.load(std::memory_order_relaxed)},
+      {"pool_allocated_bytes", pool.allocated_bytes},
+      {"pool_leased_slabs", pool.leased_slabs},
+      {"pool_cap_bytes", pool.cap_bytes},
+      {"pool_slab_bytes", pool.slab_size_bytes},
+      {"shard_load", g_state->shards->shard_loads()},
+  };
+  stream->write_function(stream, "%s\n", status.dump().c_str());
   return SWITCH_STATUS_SUCCESS;
 }
 
@@ -650,6 +822,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load) {
                  "status");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid start");
   switch_console_set_complete("add uuid_audio_fork ::console::list_uuid stop");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid pause");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid resume");
+  switch_console_set_complete("add uuid_audio_fork ::console::list_uuid modify");
 
   g_state = state.release();
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,

@@ -15,8 +15,16 @@ class SendBuffer {
  public:
   SendBuffer(SlabPool pool, std::size_t cap_bytes);
 
-  // Returns bytes discarded to make room (0 in the healthy case).
-  [[nodiscard]] std::size_t Append(ConstByteSpan bytes);
+  // `pool_exhausted` separates the two reasons audio goes: this fork's own cap
+  // (ordinary backpressure) and a dry global pool, which is what triggers the
+  // emergency degradation of DESIGN.md §5.
+  struct AppendResult {
+    std::size_t dropped_bytes = 0;
+    bool pool_exhausted = false;
+  };
+
+  // `dropped_bytes` is what was discarded to make room (0 when healthy).
+  [[nodiscard]] AppendResult Append(ConstByteSpan bytes);
 
   [[nodiscard]] ConstByteSpan Peek(std::size_t max_bytes) const { return queue_.Peek(max_bytes); }
   void Consume(std::size_t bytes) { queue_.Consume(bytes); }

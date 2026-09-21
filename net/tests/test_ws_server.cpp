@@ -1,9 +1,11 @@
 #include "test_ws_server.hpp"
 
 #include <libwebsockets.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -31,7 +33,11 @@ constexpr std::array<lws_protocols, 2> kProtocols{{
 
 }  // namespace
 
-std::unique_ptr<TestWsServer> TestWsServer::Start() {
+std::string TestTlsPath(std::string_view name) {
+  return std::string(AUDIOFORK_TEST_TLS_DIR) + "/" + std::string(name);
+}
+
+std::unique_ptr<TestWsServer> TestWsServer::Start(const TestWsTls& tls) {
   EnsureLwsLogPolicy();
   auto server = std::make_unique<TestWsServer>(PrivateTag{});
   lws_context_creation_info info{};
@@ -40,6 +46,15 @@ std::unique_ptr<TestWsServer> TestWsServer::Start() {
   info.protocols = kProtocols.data();
   info.user = server.get();
   info.options = LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
+  if (!tls.cert_file.empty()) {
+    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    info.ssl_cert_filepath = tls.cert_file.c_str();
+    info.ssl_private_key_filepath = tls.key_file.c_str();
+    if (!tls.client_ca_file.empty()) {
+      info.ssl_ca_filepath = tls.client_ca_file.c_str();
+      info.options |= LWS_SERVER_OPTION_REQUIRE_VALID_OPENSSL_CLIENT_CERT;
+    }
+  }
   server->context_ = lws_create_context(&info);
   if (server->context_ == nullptr) {
     return nullptr;
@@ -84,12 +99,24 @@ void TestWsServer::Broadcast(std::string payload, bool binary) {
   });
 }
 
+void TestWsServer::StopReadingNewConnections() { stop_reading_.store(true); }
+
 void TestWsServer::CloseAllConnections() {
   Post([this] {
     for (auto& [wsi, state] : connections_) {
       lws_set_timeout(wsi, PENDING_TIMEOUT_CLOSE_SEND, LWS_TO_KILL_ASYNC);
     }
   });
+}
+
+std::vector<std::string> TestWsServer::transcript() const {
+  const std::scoped_lock lock(transcript_mutex_);
+  return transcript_;
+}
+
+void TestWsServer::Record(std::string entry) {
+  const std::scoped_lock lock(transcript_mutex_);
+  transcript_.push_back(std::move(entry));
 }
 
 void TestWsServer::Post(std::function<void()> task) {
@@ -120,6 +147,14 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
     case LWS_CALLBACK_ESTABLISHED:
       connections_[wsi] = PerConnection{};
       total_connections_.fetch_add(1);
+      if (stop_reading_.load()) {
+        // lws stops draining the socket; the small receive buffer is what makes
+        // the peer's send queue block after a few KB instead of a few hundred
+        const int receive_bytes = 2048;
+        (void)setsockopt(lws_get_socket_fd(wsi), SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                         sizeof(receive_bytes));
+        (void)lws_rx_flow_control(wsi, 0);
+      }
       return 0;
 
     case LWS_CALLBACK_RECEIVE: {
@@ -130,9 +165,13 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
       }
       state.incoming.insert(state.incoming.end(), bytes, bytes + len);
       if (lws_is_final_fragment(wsi) != 0) {
+        const bool binary = lws_frame_is_binary(wsi) != 0;
+        Record(binary ? "binary:" + std::to_string(state.incoming.size())
+                      : "text:" + std::string(reinterpret_cast<const char*>(state.incoming.data()),
+                                              state.incoming.size()));
         std::vector<std::uint8_t> echo(LWS_PRE);
         echo.insert(echo.end(), state.incoming.begin(), state.incoming.end());
-        state.outgoing.emplace_back(std::move(echo), lws_frame_is_binary(wsi) != 0);
+        state.outgoing.emplace_back(std::move(echo), binary);
         state.incoming.clear();
         lws_callback_on_writable(wsi);
       }
@@ -156,6 +195,10 @@ int TestWsServer::HandleLws(lws* wsi, int reason, void* in, std::size_t len) {
       }
       return 0;
     }
+
+    case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE:
+      Record("close");
+      return 0;
 
     case LWS_CALLBACK_CLOSED:
       connections_.erase(wsi);

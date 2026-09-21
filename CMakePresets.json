@@ -55,7 +55,12 @@
     {"name": "fuzz", "configurePreset": "fuzz"}
   ],
   "testPresets": [
-    {"name": "asan", "configurePreset": "asan", "output": {"outputOnFailure": true}},
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {"outputOnFailure": true},
+      "environment": {"LSAN_OPTIONS": "suppressions=${sourceDir}/lsan.supp"}
+    },
     {
       "name": "tsan",
       "configurePreset": "tsan",

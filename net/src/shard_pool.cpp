@@ -50,8 +50,9 @@ class WsConnectionAdapter : public NetConnection, public WsConnectionHandler {
 NetConnection* LwsNetPort::Connect(const Endpoint& endpoint, NetHandler& handler,
                                    std::size_t max_queued_bytes) {
   auto adapter = std::make_unique<WsConnectionAdapter>(handler);
-  WsConnection* connection = loop_.Connect(WsEndpoint{endpoint.host, endpoint.port, endpoint.path},
-                                           *adapter, max_queued_bytes);
+  WsConnection* connection =
+      loop_.Connect(WsEndpoint{endpoint.host, endpoint.port, endpoint.path, endpoint.tls}, *adapter,
+                    max_queued_bytes);
   if (connection == nullptr) {
     return nullptr;
   }
@@ -69,9 +70,9 @@ void LwsNetPort::ScheduleTimer(std::chrono::milliseconds delay, std::function<vo
   loop_.ScheduleTimer(delay, std::move(task));
 }
 
-std::unique_ptr<Shard> Shard::Create(std::chrono::milliseconds tick) {
+std::unique_ptr<Shard> Shard::Create(std::chrono::milliseconds tick, const TlsOptions& tls) {
   auto shard = std::make_unique<Shard>();
-  shard->loop_ = WsEventLoop::Create();
+  shard->loop_ = WsEventLoop::Create(tls);
   if (shard->loop_ == nullptr) {
     return nullptr;
   }
@@ -96,10 +97,14 @@ void Shard::StopThread() {
 Shard::~Shard() { StopThread(); }
 
 void Shard::Adopt(std::shared_ptr<ForkSession> session) {
+  // Counted on the caller's thread, before the hop: LeastLoadedShard reads
+  // load() from that same thread, and a burst of starts would otherwise all see
+  // zero and pile onto one shard. Relaxed suffices: the count is a placement
+  // heuristic and publishes no other state.
+  load_.fetch_add(1, std::memory_order_relaxed);
   // hop onto the loop thread: sessions_ is loop-owned state
   loop_->Post([this, session = std::move(session)]() mutable {
     sessions_.push_back(session);
-    load_.store(sessions_.size(), std::memory_order_relaxed);
     session->Start();
   });
 }
@@ -113,8 +118,9 @@ void Shard::Tick() {
                                                 return session->state() != SessionState::kDead;
                                               });
   if (finished != sessions_.end()) {
+    load_.fetch_sub(static_cast<std::size_t>(sessions_.end() - finished),
+                    std::memory_order_relaxed);
     sessions_.erase(finished, sessions_.end());
-    load_.store(sessions_.size(), std::memory_order_relaxed);
   }
 }
 
@@ -126,7 +132,7 @@ std::unique_ptr<ShardPool> ShardPool::Start(const ModuleConfig& config, SlabPool
     count = hardware == 0 ? 2 : std::min<std::size_t>(hardware, 16);
   }
   for (std::size_t i = 0; i < count; ++i) {
-    auto shard = Shard::Create(kTickInterval);
+    auto shard = Shard::Create(kTickInterval, config.tls);
     if (shard == nullptr) {
       return nullptr;
     }
@@ -168,6 +174,15 @@ std::size_t ShardPool::active_forks() const {
     total += shard->load();
   }
   return total;
+}
+
+std::vector<std::size_t> ShardPool::shard_loads() const {
+  std::vector<std::size_t> loads;
+  loads.reserve(shards_.size());
+  for (const auto& shard : shards_) {
+    loads.push_back(shard->load());
+  }
+  return loads;
 }
 
 Shard& ShardPool::LeastLoadedShard() {

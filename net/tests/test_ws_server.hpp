@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -15,6 +17,18 @@ struct lws_context;
 
 namespace audiofork::net {
 
+// Absolute path to one of the test-only credentials in tests/tls (see the
+// README there).
+[[nodiscard]] std::string TestTlsPath(std::string_view name);
+
+// Empty cert_file leaves the server in plaintext. A non-empty client_ca_file
+// makes lws demand a client certificate that CA signed.
+struct TestWsTls {
+  std::string cert_file;
+  std::string key_file;
+  std::string client_ca_file;
+};
+
 // Test-only echo server: every text/binary message is echoed back on the same
 // connection. Runs its own lws context on its own thread; the public methods
 // are thread-safe and post onto that thread.
@@ -22,7 +36,7 @@ class TestWsServer {
   struct PrivateTag {};
 
  public:
-  [[nodiscard]] static std::unique_ptr<TestWsServer> Start();
+  [[nodiscard]] static std::unique_ptr<TestWsServer> Start(const TestWsTls& tls = {});
 
   explicit TestWsServer(PrivateTag);
   ~TestWsServer();
@@ -35,6 +49,13 @@ class TestWsServer {
   // Queue a text or binary frame to every live connection (playback tests).
   void Broadcast(std::string payload, bool binary);
   [[nodiscard]] int total_connections() const { return total_connections_.load(); }
+  // Ordered record of what the server saw across every connection:
+  // "text:<payload>", "binary:<byte count>", and "close" when the peer sent a
+  // close frame. A peer that resets the socket instead never adds "close".
+  [[nodiscard]] std::vector<std::string> transcript() const;
+  // Every connection established from now on completes the handshake and then
+  // never reads, so a client's send queue cannot drain.
+  void StopReadingNewConnections();
   void CloseAllConnections();
 
   [[nodiscard]] int HandleLws(lws* wsi, int reason, void* in, std::size_t len);
@@ -47,13 +68,17 @@ class TestWsServer {
 
   void Post(std::function<void()> task);
   void DrainPosted();
+  void Record(std::string entry);
 
   lws_context* context_ = nullptr;
   std::uint16_t port_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int> total_connections_{0};
+  std::atomic<bool> stop_reading_{false};
   std::mutex posted_mutex_;
   std::vector<std::function<void()>> posted_;
+  mutable std::mutex transcript_mutex_;
+  std::vector<std::string> transcript_;
   std::unordered_map<lws*, PerConnection> connections_;
   std::thread thread_;
 };

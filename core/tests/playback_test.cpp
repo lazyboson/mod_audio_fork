@@ -102,11 +102,12 @@ struct Fixture {
   FakeNet net;
   RecordingEvents events;
   FakeClock clock;
-  std::optional<SlabPool> pool = SlabPool::Create({4096, std::size_t{4096} * 512});
+  std::optional<SlabPool> pool;
   std::shared_ptr<ForkSession> session;
 
   explicit Fixture(milliseconds high = milliseconds{1000}, milliseconds low = milliseconds{200},
-                   bool playback = true) {
+                   bool playback = true, std::size_t pool_slabs = 512) {
+    pool = SlabPool::Create({4096, std::size_t{4096} * pool_slabs});
     ForkParams params;
     params.call_uuid = "call-pb";
     params.fork_id = "fork-pb";
@@ -299,6 +300,25 @@ TEST(Playback, RepeatedBargeInsStayConsistent) {
   }
   EXPECT_EQ(fx.session->stats().barge_ins, 5U);
   EXPECT_EQ(fx.events.Count(ForkEventType::kPlaybackCleared), 5U);
+}
+
+TEST(Playback, PoolExhaustionDropsInboundAudioInsteadOfBlocking) {
+  Fixture fx(milliseconds{1000}, milliseconds{200}, /*playback=*/true, /*pool_slabs=*/2);
+  const auto audio = Tone(std::size_t{4096} * 4);
+  fx.net.handler().OnBinary(ConstByteSpan(audio));
+
+  const ForkSession::Stats stats = fx.session->stats();
+  EXPECT_EQ(stats.playback_bytes_received, audio.size());
+  EXPECT_EQ(stats.playback_bytes_dropped, audio.size() / 2);
+  EXPECT_EQ(fx.events.Count(ForkEventType::kError), 1U);
+}
+
+TEST(Playback, AudioRefusedWhileMutedIsNotCountedAsADrop) {
+  Fixture fx;
+  fx.net.handler().OnText(R"({"type":"clear"})");
+  fx.net.handler().OnBinary(ConstByteSpan(Tone(kFrameBytes)));
+  EXPECT_EQ(fx.session->stats().playback_bytes_dropped, 0U);
+  EXPECT_EQ(fx.events.Count(ForkEventType::kError), 0U);
 }
 
 TEST(Playback, TeardownReportsPlaybackStopAndReleasesSlabs) {
