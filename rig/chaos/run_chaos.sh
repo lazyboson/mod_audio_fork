@@ -274,3 +274,78 @@ scenario_tls_failures() {
   recreate_freeswitch
   record tls_failures PASS "tls_handshake_failures=$failures, stop cleaned up to 0 forks"
 }
+
+# Hangup in each of the four states §7's last row funnels to DRAINING: before
+# the socket is up, while streaming, while reconnecting, and mid-drain.
+scenario_hangup_every_state() {
+  arm_mock MOCK_WS_PLAYBACK_MS=0
+  toxi_reset
+
+  connecting=$(new_uuids "$CALLS")
+  originate "$connecting"
+  sleep 3
+  add_toxic latency downstream '{"latency":3000,"jitter":0}'
+  start_forks "$connecting" "$PROXY_URL" > /dev/null
+  sleep 1
+  kill_calls "$connecting"
+  toxi_reset
+  say "hung up $CALLS forks 1s into a 3s handshake latency"
+  expect_idle "hangup_every_state/connecting"
+
+  active=$(new_uuids "$CALLS")
+  originate "$active"
+  sleep 3
+  start_forks "$active" "$DIRECT_URL" > /dev/null
+  sleep 8
+  kill_calls "$active"
+  say "hung up $CALLS forks mid-stream"
+  expect_idle "hangup_every_state/active"
+
+  reconnecting=$(new_uuids "$CALLS")
+  originate "$reconnecting"
+  sleep 3
+  start_forks "$reconnecting" "$PROXY_URL" > /dev/null
+  sleep 6
+  add_toxic timeout downstream '{"timeout":0}'
+  sleep 4
+  kill_calls "$reconnecting"
+  toxi_reset
+  say "hung up $CALLS forks while they were reconnecting"
+  expect_idle "hangup_every_state/reconnecting"
+
+  draining=$(new_uuids "$CALLS")
+  originate "$draining"
+  sleep 3
+  start_forks "$draining" "$DIRECT_URL" > /dev/null
+  sleep 6
+  # stop and kill in one batch, so the kill lands inside the drain the stop began
+  for u in $draining; do
+    echo "uuid_audio_fork $u stop"
+    echo "uuid_kill $u"
+  done | fs_batch > /dev/null
+  say "killed $CALLS forks inside the drain their stop began"
+  expect_idle "hangup_every_state/draining"
+  record hangup_every_state PASS "connecting, active, reconnecting and draining all reached 0 forks"
+}
+
+trap 'collect_logs chaos-rig-logs.txt; compose down -v >/dev/null 2>&1 || true' EXIT
+
+compose build freeswitch
+compose up -d freeswitch
+wait_for_module
+toxi /proxies '{"name":"ws","listen":"0.0.0.0:9099","upstream":"mock-ws:9099","enabled":true}' >/dev/null
+
+for name in $SCENARIOS; do
+  case " $ALL_SCENARIOS " in
+    *" $name "*) ;;
+    *) fail "unknown scenario: $name" ;;
+  esac
+  echo "== $name"
+  "scenario_$name"
+done
+
+echo
+echo "scenario                 result details"
+cat "$TABLE"
+shutdown_and_assert_exit
+echo "CHAOS PASS: $results"
