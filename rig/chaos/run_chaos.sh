@@ -69,8 +69,24 @@ mock_report() { compose exec -T freeswitch cat "${1:-/shared/mock-report.json}" 
 # report, so no scenario has to subtract the one before it.
 arm_mock() {
   compose exec -T freeswitch rm -f /shared/mock-report.json /shared/mock-wss-report.json
-  env "$@" compose up -d --force-recreate mock-ws >/dev/null 2>&1
+  MOCK_WS_PLAYBACK_MS=2000 MOCK_WS_STALL_AFTER=0 MOCK_WS_DROP_AFTER=0
+  MOCK_WS_CLEAR_MARK_HZ=0 MOCK_WS_CLEAR_MARK_SECONDS=0
+  MOCK_WS_FUZZ_DIR= MOCK_WS_FUZZ_MUTATIONS=0
+  export MOCK_WS_PLAYBACK_MS MOCK_WS_STALL_AFTER MOCK_WS_DROP_AFTER \
+    MOCK_WS_CLEAR_MARK_HZ MOCK_WS_CLEAR_MARK_SECONDS MOCK_WS_FUZZ_DIR MOCK_WS_FUZZ_MUTATIONS
+  for assignment in "$@"; do export "$assignment"; done
+  compose up -d --force-recreate mock-ws >/dev/null 2>&1
   sleep 3
+}
+
+# The cap and the CA are read at module load, so changing either means a new
+# FreeSWITCH; every scenario that does so puts the shipped values back.
+recreate_freeswitch() {
+  AUDIOFORK_GLOBAL_CAP_MB=${1:-}
+  AUDIOFORK_TLS_CA=${2:-/srv/tls/ca.pem}
+  export AUDIOFORK_GLOBAL_CAP_MB AUDIOFORK_TLS_CA
+  compose up -d --force-recreate freeswitch >/dev/null 2>&1
+  wait_for_module
 }
 
 toxi_reset() { toxi /reset >/dev/null; }
@@ -166,4 +182,95 @@ scenario_reconnect_storm() {
     fail "reconnect_storm: first reconnects spread only ${spread}ms, expected >= 100"
   expect_idle reconnect_storm
   record reconnect_storm PASS "hellos=$hellos reconnects=$reconnects spread=${spread}ms"
+}
+
+scenario_global_cap_exhaustion() {
+  arm_mock MOCK_WS_STALL_AFTER=5 MOCK_WS_PLAYBACK_MS=0
+  recreate_freeswitch "$GLOBAL_CAP_MB"
+  uuids=$(new_uuids "$CAP_FORKS")
+  originate "$uuids"
+  sleep 3
+  replies=$(start_forks "$uuids" "$DIRECT_URL")
+  sleep 20
+  status=$(status_json)
+  refused=$(printf '%s\n' "$replies" | grep -c 'global memory cap reached' || true)
+  start_failed=$(jnum start_failed "$status")
+  degraded=$(jnum degraded_forks "$status")
+  say "cap ${GLOBAL_CAP_MB}MB over $CAP_FORKS forks: -ERR replies=$refused"
+  say "start_failed=$start_failed degraded_forks=$degraded"
+  kill_calls "$uuids"
+  [ "${refused:-0}" -ge 1 ] ||
+    fail "global_cap_exhaustion: no start was refused with -ERR global memory cap reached"
+  [ "${start_failed:-0}" -ge 1 ] || [ "${degraded:-0}" -ge 1 ] ||
+    fail "global_cap_exhaustion: start_failed=$start_failed degraded_forks=$degraded, wanted one >= 1"
+  expect_idle global_cap_exhaustion
+  recreate_freeswitch
+  record global_cap_exhaustion PASS \
+    "refused=$refused start_failed=$start_failed degraded_forks=$degraded"
+}
+
+scenario_barge_in_flood() {
+  arm_mock MOCK_WS_PLAYBACK_MS=20000 \
+    "MOCK_WS_CLEAR_MARK_HZ=$BARGE_HZ" "MOCK_WS_CLEAR_MARK_SECONDS=$BARGE_SECONDS"
+  uuids=$(new_uuids "$CALLS")
+  originate "$uuids"
+  sleep 3
+  start_forks "$uuids" "$DIRECT_URL" > /dev/null
+  # read after the flood has finished, so the mock cannot send another clear
+  # between the status read and the report the count is compared against
+  sleep $((BARGE_SECONDS + 8))
+  status=$(status_json)
+  barge_ins=$(jnum barge_ins "$status")
+  texts_dropped=$(jnum pending_texts_dropped "$status")
+  say "barge_ins=$barge_ins pending_texts_dropped=$texts_dropped"
+  kill_calls "$uuids"
+  sleep 5
+  report=$(mock_report)
+  clears=$(jnum clears_sent "$report")
+  say "mock clears_sent=$clears marks_sent=$(jnum marks_sent "$report")"
+  [ "${barge_ins:-0}" -eq "${clears:-0}" ] ||
+    fail "barge_in_flood: module counted $barge_ins barge-ins for $clears clears"
+  case "$report" in
+    *'"protocol_errors":[]'*) ;;
+    *) fail "barge_in_flood: mock recorded protocol errors" ;;
+  esac
+  expect_idle barge_in_flood
+  record barge_in_flood PASS "barge_ins=$barge_ins == clears_sent=$clears"
+}
+
+scenario_json_fuzz_replay() {
+  arm_mock MOCK_WS_PLAYBACK_MS=0 MOCK_WS_FUZZ_DIR=/srv/corpus \
+    "MOCK_WS_FUZZ_MUTATIONS=$FUZZ_MUTATIONS"
+  uuids=$(new_uuids "$CALLS")
+  originate "$uuids"
+  sleep 3
+  start_forks "$uuids" "$DIRECT_URL" > /dev/null
+  sleep 20
+  status=$(status_json)
+  [ -n "$status" ] || fail "json_fuzz_replay: FreeSWITCH stopped answering"
+  say "alive under the corpus plus $FUZZ_MUTATIONS mutations: forks=$(jnum forks "$status")"
+  kill_calls "$uuids"
+  expect_idle json_fuzz_replay
+  # audio_fork status carries no json_error counter, so surviving the replay and
+  # returning to zero forks is the whole observable here; the ::json_error event
+  # is the only per-message signal and the rig does not subscribe to events.
+  record json_fuzz_replay PASS "survived; no json_error counter in status to assert on"
+}
+
+scenario_tls_failures() {
+  arm_mock MOCK_WS_PLAYBACK_MS=0
+  recreate_freeswitch "" /srv/tls/other-ca.pem
+  uuids=$(new_uuids "$CALLS")
+  originate "$uuids"
+  sleep 3
+  start_forks "$uuids" "$TLS_URL" > /dev/null
+  sleep 30
+  failures=$(jnum tls_handshake_failures "$(mock_report /shared/mock-wss-report.json)")
+  say "mock-wss tls_handshake_failures=$failures after 30s of retries"
+  [ "${failures:-0}" -ge 2 ] ||
+    fail "tls_failures: only $failures handshake failures, expected the fork to keep retrying"
+  kill_calls "$uuids"
+  expect_idle tls_failures
+  recreate_freeswitch
+  record tls_failures PASS "tls_handshake_failures=$failures, stop cleaned up to 0 forks"
 }
