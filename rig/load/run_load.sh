@@ -12,7 +12,10 @@ TOTAL_CALLS=${TOTAL_CALLS:-10000}
 CALL_RATE=${CALL_RATE:-50}
 HOLD_SECONDS=${HOLD_SECONDS:-60}
 MAX_FAILED_CALLS=${MAX_FAILED_CALLS:-0}
-WARMUP_CALLS=${WARMUP_CALLS:-200}
+# One full wave at the target concurrency: FreeSWITCH's and the allocator's
+# growth plateaus over the first few hundred calls, and a baseline taken before
+# it has is a band the measured run then climbs straight out of.
+WARMUP_CALLS=${WARMUP_CALLS:-$CONCURRENT}
 IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-300}
 SAMPLE_SECONDS=${SAMPLE_SECONDS:-5}
 RSS_TOLERANCE_PERCENT=${RSS_TOLERANCE_PERCENT:-5}

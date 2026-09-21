@@ -121,7 +121,7 @@ prompt drain look like a stall.
 |---|---|---|
 | `CONCURRENT` | 1000 | calls held open at once |
 | `TOTAL_CALLS` | 10000 | calls the run churns through |
-| `WARMUP_CALLS` | 200 | calls driven before the baseline is taken |
+| `WARMUP_CALLS` | `CONCURRENT` | calls driven before the baseline is taken |
 | `CALL_RATE` | 50 | calls per second SIPp offers |
 | `HOLD_SECONDS` | 60 | rounded up to whole 7 s pcap plays |
 | `MAX_FAILED_CALLS` | 0 | SIPp failed calls tolerated |
@@ -205,7 +205,7 @@ Knobs are the load tier's, plus `SOAK_HOURS` and `SAMPLE_SECONDS` (60).
 Reduced scale:
 
 ```sh
-SOAK_HOURS=0.15 CONCURRENT=50 WARMUP_CALLS=50 CALL_RATE=10 HOLD_SECONDS=14 \
+SOAK_HOURS=0.15 CONCURRENT=50 WARMUP_CALLS=300 CALL_RATE=10 HOLD_SECONDS=14 \
   SAMPLE_SECONDS=10 SETTLE_SECONDS=20 ./rig/load/run_soak.sh
 ```
 
@@ -214,3 +214,8 @@ It runs on `[self-hosted, soak]`: GitHub-hosted runners cap a job at 6 hours, so
 a 48 h gate cannot run there. `.github/workflows/nightly.yml` runs the load tier
 and the chaos matrix at 03:00 daily, both uploading `rig-logs/` whatever the
 outcome.
+
+The warm-up has to be large enough that growth has plateaued before the baseline
+is taken, which is why it defaults to one full wave at the target concurrency. A
+50-call warm-up followed by 1928 calls at 50 concurrent ended 5.7% above its
+baseline and failed; 300 calls of warm-up in front of the same run did not.
