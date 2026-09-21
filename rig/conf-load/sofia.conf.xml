@@ -8,7 +8,7 @@
         <param name="sip-ip" value="$${local_ip_v4}"/>
         <param name="rtp-ip" value="$${local_ip_v4}"/>
         <param name="sip-port" value="5060"/>
-        <param name="context" value="default"/>
+        <param name="context" value="load"/>
         <param name="dialplan" value="XML"/>
         <param name="auth-calls" value="false"/>
         <param name="accept-blind-reg" value="true"/>

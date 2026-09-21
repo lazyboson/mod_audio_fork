@@ -1,5 +1,5 @@
 <include>
-  <context name="default">
+  <context name="load">
     <extension name="rig-sipp">
       <condition field="destination_number" expression="^rig-sipp$">
         <action application="answer"/>
