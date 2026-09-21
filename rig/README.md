@@ -142,3 +142,46 @@ Reduced scale for a laptop:
 CONCURRENT=100 TOTAL_CALLS=1000 WARMUP_CALLS=300 CALL_RATE=20 HOLD_SECONDS=14 \
   ./rig/load/run_load.sh
 ```
+
+## Chaos matrix
+
+`rig/chaos/run_chaos.sh` runs the eight scenarios of DESIGN.md §10 decision 18
+against the observables §7 names. `SCENARIOS` picks a subset; the default is all
+eight, in order. Calls are driven over loopback with batched `fs_cli`
+(`rig/load/fs_batch.sh`) rather than SIPp, because the scenarios need per-call
+uuids to hang up and a compose exec per call would dominate the run.
+
+Each scenario recreates `mock-ws` to arm its fault, which also hands it an empty
+report, asserts with the value it saw, clears the fault, and waits for `forks`
+to return to 0 before the next one starts.
+
+| Scenario | Fault | Asserted |
+|---|---|---|
+| `vendor_stall` | `MOCK_WS_STALL_AFTER` | `buffer_dropped_bytes > 0`, clean hangups |
+| `half_open_tcp` | toxiproxy `timeout` toxic, then removal | `reconnects >= 1`, mock `resume_count >= 1` |
+| `reconnect_storm` | `reset_peer` on `STORM_FORKS` forks | all reconnect, `hello_count == 2x forks`, first-reconnect spread >= 100 ms |
+| `global_cap_exhaustion` | `global-memory-cap-mb` of `GLOBAL_CAP_MB` plus a stalled mock | `-ERR global memory cap reached`, `start_failed >= 1` or `degraded_forks >= 1` |
+| `barge_in_flood` | `BARGE_HZ` clear/mark pairs a second for `BARGE_SECONDS` | `barge_ins` equals the mock's `clears_sent`, no protocol errors |
+| `json_fuzz_replay` | `core/tests/fuzz/corpus/*` plus `FUZZ_MUTATIONS` mutations as text frames | FreeSWITCH alive, `forks` back to 0 |
+| `tls_failures` | `wss://` against a CA that did not sign the server | mock `tls_handshake_failures` keeps climbing, `stop` cleans up |
+| `hangup_every_state` | hangup while connecting, active, reconnecting and draining | `forks == 0` and `pool_leased_slabs == 0` after each |
+
+Two facts worth knowing before reading a result. Slabs are leased as audio
+arrives, not at fork start, so a single wave of forks against a tiny cap all
+*degrade* and none is refused; `global_cap_exhaustion` fills the pool with
+`CAP_FORKS` stalled forks and then starts `CAP_LATE_FORKS` more, which is what
+reaches the `CanLease` check. And `audio_fork status` carries no `json_error`
+counter — `::json_error` is an event and the rig does not subscribe to events —
+so `json_fuzz_replay` asserts survival and a clean return to zero forks, nothing
+finer.
+
+Knobs: `CALLS` (50), `STORM_FORKS` (1000), `CAP_FORKS` (20), `CAP_LATE_FORKS`
+(5), `GLOBAL_CAP_MB` (1), `BARGE_HZ` (50), `BARGE_SECONDS` (10),
+`FUZZ_MUTATIONS` (200). Reduced scale:
+
+```sh
+CALLS=5 STORM_FORKS=20 ./rig/chaos/run_chaos.sh
+SCENARIOS="vendor_stall tls_failures" CALLS=5 ./rig/chaos/run_chaos.sh
+```
+
+The PASS/FAIL table lands in `rig-logs/chaos-table.txt`.
