@@ -1,0 +1,15 @@
+<configuration name="switch.conf" description="rig load core">
+  <!-- One SIP session per call here, against the base rig's two loopback legs,
+       but the nightly tier runs 1000 concurrent and the chaos matrix still uses
+       loopback pairs. -->
+  <settings>
+    <param name="max-sessions" value="3000"/>
+    <param name="sessions-per-second" value="400"/>
+    <param name="max-db-handles" value="10"/>
+    <!-- FreeSWITCH 1.10.12 on musl SIGSEGVs at shutdown in
+         switch_core_session_thread_pool_worker once any session has carried an
+         SMBF_WRITE_REPLACE media bug (DESIGN.md §13). -->
+    <param name="session-thread-pool" value="false"/>
+    <param name="rtp-enable-zrtp" value="false"/>
+  </settings>
+</configuration>

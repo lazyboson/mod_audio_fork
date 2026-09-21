@@ -1,0 +1,11 @@
+<include>
+  <context name="load">
+    <extension name="rig-sipp">
+      <condition field="destination_number" expression="^rig-sipp$">
+        <action application="answer"/>
+        <action application="set" data="api_result=${uuid_audio_fork(${uuid} start ws://mock-ws:9099/ mono 16000 {&quot;tier&quot;:&quot;load&quot;})}"/>
+        <action application="playback" data="tone_stream://%(600000,0,350,440);loops=-1"/>
+      </condition>
+    </extension>
+  </context>
+</include>

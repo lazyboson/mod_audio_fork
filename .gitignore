@@ -6,3 +6,5 @@ compile_commands.json
 *.so
 .DS_Store
 rig-logs.txt
+__pycache__/
+rig-logs/

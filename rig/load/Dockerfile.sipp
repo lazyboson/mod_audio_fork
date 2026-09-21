@@ -1,0 +1,8 @@
+# SIPp is only packaged in Alpine's edge/testing repository. The exact package
+# version is pinned so a nightly run cannot silently change call generator.
+FROM alpine:edge
+
+RUN echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories && \
+    apk add --no-cache sipp=3.7.7-r0
+
+ENTRYPOINT ["sipp"]

@@ -1,0 +1,48 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      concurrent:
+        description: concurrent calls the load tier drives
+        default: "1000"
+      total_calls:
+        description: calls the load tier churns through
+        default: "10000"
+      chaos_scenarios:
+        description: space-separated scenario names, empty for all
+        default: ""
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: 1000 concurrent, 10000 calls, hard leak assertions
+        env:
+          CONCURRENT: ${{ inputs.concurrent || '1000' }}
+          TOTAL_CALLS: ${{ inputs.total_calls || '10000' }}
+        run: ./rig/load/run_load.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-logs
+          path: rig-logs/
+
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: the eight DESIGN section 7 failure scenarios
+        env:
+          SCENARIOS: ${{ inputs.chaos_scenarios }}
+        run: ./rig/chaos/run_chaos.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-logs
+          path: rig-logs/

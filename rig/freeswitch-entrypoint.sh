@@ -8,7 +8,10 @@ set -eu
 
 TEMPLATE=/srv/audio_fork.conf.xml.in
 CONFIG=/srv/audio_fork.conf.xml
-CA=/srv/tls/ca.pem
+# The chaos matrix recreates this container with a CA that did not sign the
+# server, and with a cap small enough to exhaust.
+CA=${AUDIOFORK_TLS_CA:-/srv/tls/ca.pem}
+CAP_MB=${AUDIOFORK_GLOBAL_CAP_MB:-}
 
 [ -f "$TEMPLATE" ] || { echo "no config template at $TEMPLATE" >&2; exit 1; }
 [ -f "$CA" ] || { echo "no test CA at $CA" >&2; exit 1; }
@@ -18,5 +21,12 @@ sed 's#name="tls-ca-file" value=""#name="tls-ca-file" value="'"$CA"'"#' \
 
 grep -q "value=\"$CA\"" "$CONFIG" ||
   { echo "tls-ca-file was not substituted; did the shipped param change?" >&2; exit 1; }
+
+if [ -n "$CAP_MB" ]; then
+  sed -i 's#name="global-memory-cap-mb" value="[0-9]*"#name="global-memory-cap-mb" value="'"$CAP_MB"'"#' \
+    "$CONFIG"
+  grep -q "name=\"global-memory-cap-mb\" value=\"$CAP_MB\"" "$CONFIG" ||
+    { echo "global-memory-cap-mb was not substituted" >&2; exit 1; }
+fi
 
 exec freeswitch -nf -nonat -nosql
