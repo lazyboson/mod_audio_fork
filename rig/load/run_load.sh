@@ -39,16 +39,6 @@ compose build sipp
 compose up -d freeswitch
 wait_for_module
 
-sample() {
-  status=$(status_json)
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$(date -u +%H:%M:%S)" \
-    "$(jnum forks "$status")" "$(jnum sent_bytes "$status")" \
-    "$(jnum media_dropped_bytes "$status")" "$(jnum buffer_dropped_bytes "$status")" \
-    "$(jnum reconnects "$status")" "$(jnum pool_leased_slabs "$status")" \
-    "$(jnum degraded_forks "$status")" "$(fs_rss_kb)" "$(fs_fd_count)" >> "$CSV"
-}
-
 sipp_run() {
   compose run --rm --entrypoint sh sipp -c \
     "sipp -i \$(hostname -i) -sf /shared/logs/uac_tone.xml -s rig-sipp freeswitch:5060 \
@@ -57,23 +47,11 @@ sipp_run() {
        -nostdin" > "$LOG_DIR/$2.log" 2>&1
 }
 
-# Drain is watched on forks, not on SIPp's exit: the last BYE only starts the
-# state machine's DRAINING→DEAD walk, and the sample after it must be idle.
-wait_for_idle() {
-  i=0
-  while [ "$i" -lt "$IDLE_TIMEOUT_SECONDS" ]; do
-    [ "$(jnum forks "$(status_json)")" = "0" ] && return 0
-    i=$((i + 2))
-    sleep 2
-  done
-  fail "forks never returned to 0 within ${IDLE_TIMEOUT_SECONDS}s"
-}
-
 mock_report() {
   compose exec -T freeswitch cat /shared/mock-report.json
 }
 
-echo "time,forks,sent_bytes,media_dropped_bytes,buffer_dropped_bytes,reconnects,pool_leased_slabs,degraded_forks,rss_kb,fds" > "$CSV"
+start_sampler "$(basename "$CSV")" "$SAMPLE_SECONDS"
 
 echo "warm-up: $WARMUP_CALLS calls"
 sipp_run "$WARMUP_CALLS" sipp-warmup || fail "the warm-up SIPp run exited $?"
@@ -87,23 +65,15 @@ baseline_rss=$(fs_rss_kb)
 baseline_fd=$(fs_fd_count)
 hellos_before=$(jnum hello_count "$(mock_report)")
 echo "baseline at idle: rss=${baseline_rss}kB fds=$baseline_fd hellos=$hellos_before"
-sample
 
 echo "starting SIPp: $TOTAL_CALLS calls, $CONCURRENT concurrent, ${CALL_RATE}/s, ${PLAY_LOOPS}x7s hold"
-sipp_run "$TOTAL_CALLS" sipp-load &
-sipp_pid=$!
-
-while kill -0 "$sipp_pid" 2>/dev/null; do
-  sample
-  sleep "$SAMPLE_SECONDS"
-done
-wait "$sipp_pid" && sipp_code=0 || sipp_code=$?
+sipp_run "$TOTAL_CALLS" sipp-load && sipp_code=0 || sipp_code=$?
 echo "sipp exit code: $sipp_code"
 
 wait_for_idle
 echo "settling for ${SETTLE_SECONDS}s before the leak assertions"
 sleep "$SETTLE_SECONDS"
-sample
+fetch_samples "$(basename "$CSV")"
 
 final=$(status_json)
 report=$(mock_report)

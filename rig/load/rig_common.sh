@@ -56,6 +56,37 @@ fs_fd_count() {
     'pid=$(pgrep -x freeswitch | head -1); ls /proc/$pid/fd | wc -l' | tr -d '\r'
 }
 
+# The sampler writes into the report volume so the CSV survives the host's exec
+# latency; fetch_samples copies it out once, at the end.
+start_sampler() {
+  compose exec -d freeswitch sh /srv/load/sampler.sh "/shared/$1" "$2"
+}
+
+fetch_samples() {
+  compose exec -T freeswitch cat "/shared/$1" > "$LOG_DIR/$1" 2>/dev/null ||
+    echo "no samples at /shared/$1" >&2
+}
+
+# Wall clock, not poll count: one poll costs a compose exec, which is seconds on
+# a loaded Docker Desktop, so counting polls times the wait out far too early.
+wait_for_idle() {
+  deadline=$(( $(date +%s) + ${IDLE_TIMEOUT_SECONDS:-300} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(jnum forks "$(status_json)")" = "0" ] && return 0
+    sleep 2
+  done
+  fail "forks never returned to 0 within ${IDLE_TIMEOUT_SECONDS:-300}s"
+}
+
+# busybox wget is the only HTTP client in the FreeSWITCH image and cannot send
+# DELETE, so toxics are cleared with toxiproxy's POST /reset rather than by
+# deleting them one at a time.
+toxi() {
+  compose exec -T freeswitch wget -q -O - -T 15 \
+    --header='Content-Type: application/json' --post-data="${2:-}" \
+    "http://toxiproxy:8474$1"
+}
+
 wait_for_module() {
   i=0
   while [ "$i" -lt 60 ]; do
