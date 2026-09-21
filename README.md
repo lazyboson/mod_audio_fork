@@ -1,12 +1,5 @@
 # mod_audio_fork
 
-> ## 🚧 UNDER CONSTRUCTION 🚧
->
-> **This module is not finished and must not be used in production.** It is being
-> built milestone by milestone (see [Status](#status)); the nightly load tier,
-> the chaos matrix, and the 48h soak release gate are still outstanding. APIs,
-> wire protocol, and configuration may change without notice until M5 lands.
-
 Bidirectional FreeSWITCH audio-fork module over WebSockets: streams call audio
 to a WS server and plays returned audio into the call. A stability-focused
 replacement for drachtio's `mod_audio_fork`, designed for ~1,000 concurrent
@@ -143,31 +136,3 @@ The server drives playback over the same socket: binary frames are PCM to put in
 the caller's ear, `{"type":"clear"}` is barge-in (flushes buffered audio and
 mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback",
 "rate":…}` declares a rate other than the fork's.
-
-## Status
-
-- M1 (core foundation) ✅ — session state machine, SPSC ring, slab pool, with
-  unit, exhaustive-interleaving, and sanitizer test suites.
-- M2 (network shim + protocol) ✅ — libwebsockets RAII event loop (`net/`),
-  wire-protocol codec with libFuzzer harness, jittered reconnect backoff,
-  TLS/mTLS with system-CA verification, a patched lws use-after-free.
-- M3 (module shell + fork path) ✅ — sharded runtime, the drachtio-compatible
-  verbs plus `pause`/`resume`/`modify`, DTMF forwarding, `audio_fork status`
-  JSON. Verified on FreeSWITCH 1.10.12 by the 50-call smoke (`rig/run_smoke.sh`,
-  CI job `rig-smoke`): hello/audio/bye per call, counters back to zero,
-  FreeSWITCH exits 0.
-- M4 (playback) ✅ — jitter buffer, WRITE_REPLACE injection with rate
-  conversion, watermark flow control, `clear`/`mark` barge-in; the smoke
-  asserts server audio reaches the caller byte-for-byte.
-- Memory design (DESIGN.md §5) ✅ — global cap refuses new forks
-  (`start_failed`) and degrades stalled ones to the emergency cap (`degraded`).
-- Packaging (DESIGN.md §13) ✅ — one exported symbol, CycloneDX SBOM in the
-  image, Renovate pin bumps.
-- M5 (load, chaos, soak) — **in progress**: nightly SIPp load tier with leak
-  assertions, toxiproxy chaos matrix, and the 48h soak gate live under
-  `rig/load/` and `rig/chaos/`. Until the soak gate is green, do not deploy —
-  see the banner above.
-
-## License
-
-[MIT](LICENSE).
