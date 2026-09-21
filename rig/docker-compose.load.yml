@@ -1,0 +1,53 @@
+services:
+  # The PR smoke is the base file's default workload; the load and chaos tiers
+  # drive their own calls, so it only runs when its profile is asked for.
+  smoke:
+    profiles: ["smoke"]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host", "0.0.0.0", "-port", "8474"]
+
+  # The fault knobs the chaos matrix drives, and the corpus scenario 6 replays.
+  # A scenario recreates this service to arm a fault, which also hands it a
+  # fresh report to assert against.
+  mock-ws:
+    environment:
+      MOCK_WS_PLAYBACK_MS: "${MOCK_WS_PLAYBACK_MS:-2000}"
+      MOCK_WS_STALL_AFTER: "${MOCK_WS_STALL_AFTER:-0}"
+      MOCK_WS_DROP_AFTER: "${MOCK_WS_DROP_AFTER:-0}"
+      MOCK_WS_CLEAR_MARK_HZ: "${MOCK_WS_CLEAR_MARK_HZ:-0}"
+      MOCK_WS_CLEAR_MARK_SECONDS: "${MOCK_WS_CLEAR_MARK_SECONDS:-0}"
+      MOCK_WS_FUZZ_DIR: "${MOCK_WS_FUZZ_DIR:-}"
+      MOCK_WS_FUZZ_MUTATIONS: "${MOCK_WS_FUZZ_MUTATIONS:-0}"
+    volumes:
+      - ../core/tests/fuzz/corpus:/srv/corpus:ro
+
+  freeswitch:
+    depends_on:
+      - mock-ws
+      - mock-wss
+      - toxiproxy
+    environment:
+      AUDIOFORK_TLS_CA: "${AUDIOFORK_TLS_CA:-/srv/tls/ca.pem}"
+      AUDIOFORK_GLOBAL_CAP_MB: "${AUDIOFORK_GLOBAL_CAP_MB:-}"
+    volumes:
+      - ./load:/srv/load:ro
+      - ./conf-load/freeswitch.xml:/etc/freeswitch/freeswitch.xml:ro
+      - ./conf-load/autoload_configs/modules.conf.xml:/etc/freeswitch/autoload_configs/modules.conf.xml:ro
+      - ./conf-load/autoload_configs/switch.conf.xml:/etc/freeswitch/autoload_configs/switch.conf.xml:ro
+      - ./conf-load:/srv/conf-load:ro
+
+  sipp:
+    build:
+      context: .
+      dockerfile: load/Dockerfile.sipp
+    image: ${SIPP_IMAGE:-afrig-sipp}
+    depends_on:
+      - freeswitch
+    volumes:
+      - ./load:/srv/load:ro
+      - ../rig-logs:/shared/logs
+    # SIPp's own exit code is the call-failure verdict, so the container must
+    # not be restarted or its status rewritten by compose.
+    restart: "no"
