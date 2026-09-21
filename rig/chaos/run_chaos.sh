@@ -159,7 +159,9 @@ scenario_reconnect_storm() {
   sleep 10
   start_forks "$uuids" "$PROXY_URL" > /dev/null
   sleep 15
-  add_toxic reset_peer downstream '{"timeout":0}'
+  # upstream: toxiproxy's reset toxic fires on the first chunk it sees, and with
+  # playback off the fork's own audio is the only thing moving
+  add_toxic reset_peer upstream '{"timeout":0}'
   sleep 3
   # cleared straight away: left on, every backoff retry would be RST too and
   # the hello count would never settle at two per fork
