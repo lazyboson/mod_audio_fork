@@ -15,10 +15,12 @@ Target: ~1,000 concurrent calls per box.
 
 ## Status
 
-M1–M4 (DESIGN.md §12) are implemented and covered by unit, interleaving, and
-sanitizer suites: core state machine, lws shim, module shell, fork path,
-playback, `send_text` passthrough, DTMF forwarding. Nothing has run on a live
-call yet — live-call and `rig/` load verification are M5.
+M1–M4 (DESIGN.md §12) are implemented, unit/interleaving/sanitizer tested, and
+verified on a real FreeSWITCH 1.10.12 through the 50-call rig (`rig/run_smoke.sh`,
+CI job `rig-smoke`): fork path, playback round-trip, graceful bye, TLS/mTLS,
+`send_text`, DTMF forwarding, `pause`/`resume`/`modify`, memory-cap degradation.
+Packaging (one exported symbol, SBOM, Renovate) is in. M5's nightly load tier,
+chaos matrix and 48h soak gate are in progress under `rig/load/` and `rig/chaos/`.
 
 ## Layout contract
 

@@ -3,9 +3,9 @@
 > ## 🚧 UNDER CONSTRUCTION 🚧
 >
 > **This module is not finished and must not be used in production.** It is being
-> built milestone by milestone (see [Status](#status)); playback, the load rig,
-> and the soak-test release gate are still outstanding. APIs, wire protocol, and
-> configuration may change without notice until M5 lands.
+> built milestone by milestone (see [Status](#status)); the nightly load tier,
+> the chaos matrix, and the 48h soak release gate are still outstanding. APIs,
+> wire protocol, and configuration may change without notice until M5 lands.
 
 Bidirectional FreeSWITCH audio-fork module over WebSockets: streams call audio
 to a WS server and plays returned audio into the call. A stability-focused
@@ -150,23 +150,20 @@ mutes until the next `{"type":"mark","name":…}`), and `{"type":"start_playback
   unit, exhaustive-interleaving, and sanitizer test suites.
 - M2 (network shim + protocol) ✅ — libwebsockets RAII event loop (`net/`),
   wire-protocol codec with libFuzzer harness, jittered reconnect backoff,
-  echo/reconnect integration tests against an in-process mock WS server.
-- M3 (module shell + fork path) — **partially complete.** The fork path,
-  sharded runtime, and the full drachtio-compatible command surface (`start`,
-  `stop`, `send_text`, `audio_fork status`) plus automatic DTMF forwarding are
-  implemented and covered by tests green under ASan/UBSan and TSan.
-
-  Verified against a real FreeSWITCH 1.10.12: the module compiles against its
-  headers, loads and unloads cleanly, reads `audio_fork.conf.xml`, and answers
-  `uuid_audio_fork` / `audio_fork status`.
-
-  **Not yet verified:** audio flowing through a live call, and the 50-call
-  smoke run (`rig/`). Those close out with the load rig in M5. Do not deploy
-  this yet — see the banner above.
-- M4 (playback) — **implemented, same verification gap as M3.** Jitter buffer,
-  WRITE_REPLACE injection with rate conversion, watermark flow control, and
-  `clear`/`mark` barge-in. 139 tests green under both sanitizers, including
-  byte-exact playback, barge-in, and app-text/DTMF passthrough over real
-  sockets. Playback has never been heard on a live call, and no DTMF digit has
-  ever been forwarded from one — that needs the rig.
-- M5 (chaos + soak) — not started: rig completion, nightly load tier, 48h gate.
+  TLS/mTLS with system-CA verification, a patched lws use-after-free.
+- M3 (module shell + fork path) ✅ — sharded runtime, the drachtio-compatible
+  verbs plus `pause`/`resume`/`modify`, DTMF forwarding, `audio_fork status`
+  JSON. Verified on FreeSWITCH 1.10.12 by the 50-call smoke (`rig/run_smoke.sh`,
+  CI job `rig-smoke`): hello/audio/bye per call, counters back to zero,
+  FreeSWITCH exits 0.
+- M4 (playback) ✅ — jitter buffer, WRITE_REPLACE injection with rate
+  conversion, watermark flow control, `clear`/`mark` barge-in; the smoke
+  asserts server audio reaches the caller byte-for-byte.
+- Memory design (DESIGN.md §5) ✅ — global cap refuses new forks
+  (`start_failed`) and degrades stalled ones to the emergency cap (`degraded`).
+- Packaging (DESIGN.md §13) ✅ — one exported symbol, CycloneDX SBOM in the
+  image, Renovate pin bumps.
+- M5 (load, chaos, soak) — **in progress**: nightly SIPp load tier with leak
+  assertions, toxiproxy chaos matrix, and the 48h soak gate live under
+  `rig/load/` and `rig/chaos/`. Until the soak gate is green, do not deploy —
+  see the banner above.
