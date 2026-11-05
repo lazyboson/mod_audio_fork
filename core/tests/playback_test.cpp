@@ -197,6 +197,28 @@ TEST(Playback, PartialFrameReturnsOnlyWhatExists) {
   EXPECT_EQ(frame, audio);
 }
 
+// refilling the ring only once it is empty means the media thread has already
+// underrun, which the caller hears as a frame of silence mid-speech
+TEST(Playback, PumpTopsUpARingThatIsOnlyPartlyDrained) {
+  Fixture fx;
+  const auto audio = Tone(kFrameBytes * 50, 9);
+  fx.net.handler().OnBinary(ConstByteSpan(audio));
+
+  std::vector<std::uint8_t> played;
+  for (int i = 0; i < 5; ++i) {
+    const auto frame = fx.ReadFrame();
+    played.insert(played.end(), frame.begin(), frame.end());
+  }
+  fx.session->Pump();
+  // no further ticks: what the ring holds now is all the media thread can get
+  const auto rest = fx.ReadAllFrames();
+
+  EXPECT_GE(rest.size(), kFrameBytes * 10);
+  played.insert(played.end(), rest.begin(), rest.end());
+  ASSERT_LE(played.size(), audio.size());
+  EXPECT_TRUE(std::equal(played.begin(), played.end(), audio.begin()));
+}
+
 TEST(Playback, StartPlaybackDeclaresFormat) {
   Fixture fx;
   fx.net.handler().OnText(R"({"type":"start_playback","rate":8000,"channels":1})");

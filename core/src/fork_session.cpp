@@ -552,9 +552,17 @@ void ForkSession::PumpPlayback() {
   if (!playback_.has_value()) {
     return;
   }
-  // hand as much as the ring will take; the media thread paces actual playback
+  // top up with whatever fits; the media thread paces actual playback. Push is
+  // all-or-nothing, so a ring-sized chunk only ever fitted an empty ring, i.e.
+  // after the media thread had already underrun
   while (!playback_->empty()) {
-    const ConstByteSpan chunk = playback_->Peek(tuning_.playback_handoff_bytes);
+    // even, so a 16-bit sample is never split across two pushes
+    const std::size_t room =
+        (playback_ring_->capacity() - playback_ring_->size()) & ~static_cast<std::size_t>(1);
+    if (room == 0) {
+      break;
+    }
+    const ConstByteSpan chunk = playback_->Peek(std::min(tuning_.playback_handoff_bytes, room));
     if (chunk.empty() || !playback_ring_->Push(chunk)) {
       break;
     }

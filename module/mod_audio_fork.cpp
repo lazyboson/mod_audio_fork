@@ -252,7 +252,10 @@ ForkSession::Tuning MakeTuning(const ModuleConfig& config, const AudioFormat& fo
       playback_format.BytesForDuration(config.playback_high_watermark);
   tuning.playback_low_watermark_bytes =
       playback_format.BytesForDuration(config.playback_low_watermark);
-  tuning.playback_handoff_bytes = playback_format.BytesForDuration(config.coalesce_max);
+  // at least 100 ms: the ring is refilled from the shard's tick, and one
+  // coalesce window (20 ms at the low-latency setting) leaves a late tick no margin
+  tuning.playback_handoff_bytes = playback_format.BytesForDuration(
+      std::max(config.coalesce_max, std::chrono::milliseconds{100}));
   return tuning;
 }
 
