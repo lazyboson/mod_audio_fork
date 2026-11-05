@@ -470,6 +470,20 @@ TEST(ForkSession, PoolExhaustionDegradesTheStarvedForkOnceThenRecovers) {
   EXPECT_EQ(starved.session->stats().buffered_bytes, pcm.size() * 4);
 }
 
+// a late tick finds several coalesce windows waiting; holding any back means
+// the stream is behind for the rest of the call
+TEST(ForkSession, OnePumpSendsEveryCoalesceWindowThatIsWaiting) {
+  Fixture fx;
+  fx.Connect();
+  const auto backlog = Frame(kBytesPerSecond * 3 / 10, 7);
+  ASSERT_TRUE(fx.session->PushAudio(ConstByteSpan(backlog)));
+
+  fx.session->Pump();
+
+  EXPECT_EQ(fx.net.live().binary, backlog);
+  EXPECT_EQ(fx.session->stats().buffered_bytes, 0U);
+}
+
 TEST(ForkSession, MinimumSlabsHoldsOneCoalescedMessagePlusOne) {
   ForkSession::Tuning tuning;
   tuning.coalesce_max_bytes = 6400;

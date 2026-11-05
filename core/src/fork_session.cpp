@@ -448,14 +448,14 @@ void ForkSession::FlushToConnection() {
   if (connection_ == nullptr) {
     return;
   }
-  std::size_t sent_this_tick = 0;
-  while (!buffer_.empty() && sent_this_tick < tuning_.coalesce_max_bytes) {
-    const ConstByteSpan chunk = buffer_.Peek(tuning_.coalesce_max_bytes - sent_this_tick);
+  // no per-tick cap: the tick is rescheduled from now, so audio a late tick
+  // left behind could never be caught up and the stream fell steadily behind
+  while (!buffer_.empty()) {
+    const ConstByteSpan chunk = buffer_.Peek(tuning_.coalesce_max_bytes);
     if (chunk.empty() || !connection_->SendBinary(chunk)) {
       return;
     }
     buffer_.Consume(chunk.size());
-    sent_this_tick += chunk.size();
     sent_bytes_.fetch_add(chunk.size(), std::memory_order_relaxed);
   }
   buffered_bytes_.store(buffer_.size(), std::memory_order_relaxed);
